@@ -2,15 +2,15 @@
 ComplexDDG数据处理模块
 包含数据集定义和数据加载相关函数
 """
-
+import sys
 import torch
-import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
-import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
-from pdb import set_trace
+from typing import Dict, Any
+# 导入模型定义和特征提取器
+from model import DDGModelTester, InterfaceGraphData
+from feature_extractor import RealFeatureExtractor
 
 
 def custom_collate_fn(batch):
@@ -60,9 +60,9 @@ def collate_graph_data(graphs):
     all_batch = []
     all_atom_names = []
     all_is_mutation = []
+    all_residue_indices = []
     
     offset = 0
-    edge_offset = 0
     
     for i, graph in enumerate(graphs):
         # 节点特征
@@ -70,6 +70,7 @@ def collate_graph_data(graphs):
         all_node_positions.append(graph.node_positions)
         all_atom_names.extend(graph.atom_names)
         all_is_mutation.append(graph.is_mutation)
+        all_residue_indices.extend(graph.residue_indices)
         
         # 批次索引
         batch_indices = torch.ones(graph.node_features.shape[0]) * i
@@ -92,19 +93,16 @@ def collate_graph_data(graphs):
         node_positions=torch.cat(all_node_positions, dim=0),
         batch=torch.cat(all_batch, dim=0),
         atom_names=all_atom_names,
-        is_mutation=torch.cat(all_is_mutation, dim=0)
+        is_mutation=torch.cat(all_is_mutation, dim=0),
+        residue_indices=all_residue_indices
     )
-
-# 导入模型定义和特征提取器
-from model import DDGModelTester, InterfaceGraphData
-from feature_extractor import RealFeatureExtractor
 
 
 class SKEMPIDataset(Dataset):
     """SKEMPI数据集类"""
     
     def __init__(self, data_path: str, pdb_base_path: str, 
-                 use_dummy_features: bool = False, cache_dir: str = "./dataset_cache_optimized",
+                 cache_dir: str = "./dataset_cache_optimized",
                  use_geometric_features: bool = True):
         """
         初始化数据集
@@ -112,13 +110,11 @@ class SKEMPIDataset(Dataset):
         Args:
             data_path: 数据文件路径
             pdb_base_path: PDB文件基础路径
-            use_dummy_features: 是否使用虚拟特征（用于测试）
             cache_dir: 缓存目录
             use_geometric_features: 是否使用几何特征
         """
         self.data_path = data_path
         self.pdb_base_path = pdb_base_path
-        self.use_dummy_features = use_dummy_features
         self.use_geometric_features = use_geometric_features
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
@@ -128,17 +124,14 @@ class SKEMPIDataset(Dataset):
         print(f"加载数据集: {len(self.data)} 个样本")
         
         # 初始化特征提取器
-        if not use_dummy_features:
-            self.feature_extractor = RealFeatureExtractor(
-                pdb_base_path=pdb_base_path,
-                cache_dir=str(self.cache_dir),
-                use_esm=True
-            )
-        else:
-            self.feature_extractor = None
+        self.feature_extractor = RealFeatureExtractor(
+            pdb_base_path=pdb_base_path,
+            cache_dir=str(self.cache_dir),
+            use_esm=True
+        )
         
         # 初始化几何特征提取器
-        if use_geometric_features and not use_dummy_features:
+        if use_geometric_features:
             self.geometric_tester = DDGModelTester(
                 pdb_base_path=pdb_base_path,
                 cache_dir=str(self.cache_dir) + "_geometric",
@@ -146,9 +139,6 @@ class SKEMPIDataset(Dataset):
             )
         else:
             self.geometric_tester = None
-            
-        # 预计算特征（可选）
-        self.precomputed_features = None
         
     def __len__(self) -> int:
         return len(self.data)
@@ -171,48 +161,26 @@ class SKEMPIDataset(Dataset):
             actual_chain = chain
             mutation = mutation_str
         
-        if self.use_dummy_features:
-            # 使用虚拟特征用于测试
-            esm_embedding = torch.randn(1, 1280)  # [seq_len, esm_dim]
-            foldx_features = torch.randn(22)  # [foldx_dim]
-            attention_mask = torch.ones(1)  # [seq_len]
-            
-            # 创建虚拟的几何图数据
-            if self.use_geometric_features:
-                wt_graph = self._create_dummy_graph()
-                mt_graph = self._create_dummy_graph()
-            else:
-                wt_graph = None
-                mt_graph = None
+        # 提取真实特征
+        seq_feat, energy_feat = self.feature_extractor.extract_features(
+            pdb_id, actual_chain, mutation
+        )
+        
+        esm_embedding = torch.tensor(seq_feat, dtype=torch.float32).unsqueeze(0)  # [1, esm_dim]
+        foldx_features = torch.tensor(energy_feat, dtype=torch.float32)  # [foldx_dim]
+        attention_mask = torch.ones(1, dtype=torch.float32)  # [1]
+        
+        # 提取几何特征
+        if self.use_geometric_features and self.geometric_tester is not None:
+            wt_graph, mt_graph = self.geometric_tester.extract_geometric_features(
+                pdb_id, actual_chain, mutation
+            )
+            if wt_graph is None or mt_graph is None:
+                print(f"{pdb_id} {actual_chain} {mutation} 几何特征提取失败")
+                sys.exit()
         else:
-            # 提取真实特征
-            if self.precomputed_features is not None:
-                # 使用预计算的特征
-                esm_embedding = self.precomputed_features['esm'][idx]
-                foldx_features = self.precomputed_features['foldx'][idx]
-                attention_mask = self.precomputed_features['mask'][idx]
-            else:
-                # 实时提取特征
-                seq_feat, energy_feat = self.feature_extractor.extract_features(
-                    pdb_id, actual_chain, mutation
-                )
-                
-                esm_embedding = torch.tensor(seq_feat, dtype=torch.float32).unsqueeze(0)  # [1, esm_dim]
-                foldx_features = torch.tensor(energy_feat, dtype=torch.float32)  # [foldx_dim]
-                attention_mask = torch.ones(1, dtype=torch.float32)  # [1]
-            
-            # 提取几何特征
-            if self.use_geometric_features and self.geometric_tester is not None:
-                wt_graph, mt_graph = self.geometric_tester.extract_geometric_features(
-                    pdb_id, actual_chain, mutation
-                )
-                if wt_graph is None or mt_graph is None:
-                    # 如果几何特征提取失败，创建虚拟图
-                    wt_graph = self._create_dummy_graph()
-                    mt_graph = self._create_dummy_graph()
-            else:
-                wt_graph = None
-                mt_graph = None
+            wt_graph = None
+            mt_graph = None
         
         ddg_target = torch.tensor([ddg_value], dtype=torch.float32)
         
@@ -233,40 +201,6 @@ class SKEMPIDataset(Dataset):
         
         return result
     
-    def _create_dummy_graph(self) -> InterfaceGraphData:
-        """创建虚拟的几何图数据"""
-        num_nodes = 10
-        return InterfaceGraphData(
-            node_features=torch.randn(num_nodes, 64),  # 优化后的维度
-            edge_index=torch.randint(0, num_nodes, (2, 20)),
-            edge_features=torch.randn(20, 64),  # 优化后的维度
-            edge_types=torch.randint(0, 3, (20,)),
-            node_positions=torch.randn(num_nodes, 3),
-            batch=torch.zeros(num_nodes, dtype=torch.long),
-            atom_names=['CA'] * num_nodes,
-            is_mutation=torch.zeros(num_nodes, dtype=torch.bool)
-        )
-    
-    def precompute_features(self):
-        """预计算所有特征以加速训练"""
-        print("预计算数据集特征...")
-        self.precomputed_features = {
-            'esm': [],
-            'foldx': [],
-            'mask': []
-        }
-        
-        for i in range(len(self.data)):
-            if i % 10 == 0:
-                print(f"预计算进度: {i}/{len(self.data)}")
-            
-            sample = self.__getitem__(i)
-            self.precomputed_features['esm'].append(sample['esm_embeddings'])
-            self.precomputed_features['foldx'].append(sample['foldx_features'])
-            self.precomputed_features['mask'].append(sample['attention_mask'])
-        
-        print("特征预计算完成")
-
 
 def create_dataloader(
     data_path: str,
@@ -274,7 +208,6 @@ def create_dataloader(
     batch_size: int = 32,
     shuffle: bool = True,
     num_workers: int = 4,
-    use_dummy_features: bool = False,
     cache_dir: str = "./dataset_cache",
     use_geometric_features: bool = True
 ) -> DataLoader:
@@ -287,7 +220,6 @@ def create_dataloader(
         batch_size: 批大小
         shuffle: 是否打乱数据
         num_workers: 数据加载工作进程数
-        use_dummy_features: 是否使用虚拟特征
         cache_dir: 缓存目录
         use_geometric_features: 是否使用几何特征
     
@@ -297,7 +229,6 @@ def create_dataloader(
     dataset = SKEMPIDataset(
         data_path=data_path,
         pdb_base_path=pdb_base_path,
-        use_dummy_features=use_dummy_features,
         cache_dir=cache_dir,
         use_geometric_features=use_geometric_features
     )
@@ -311,105 +242,6 @@ def create_dataloader(
         drop_last=False,
         collate_fn=custom_collate_fn if use_geometric_features else None
     )
-
-
-def split_dataset_by_complex(data_path: str, train_ratio: float = 0.8, random_seed: int = 42) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    按复合物划分数据集
-    
-    Args:
-        data_path: 数据文件路径
-        train_ratio: 训练集比例
-        random_seed: 随机种子
-    
-    Returns:
-        (train_data, val_data): 训练集和验证集
-    """
-    # 加载数据
-    data = pd.read_csv(data_path, sep='\t')
-    
-    # 获取所有唯一复合物
-    complex_ids = data['#Pdb_origin'].unique()
-    np.random.seed(random_seed)
-    np.random.shuffle(complex_ids)
-    
-    # 划分复合物
-    split_idx = int(len(complex_ids) * train_ratio)
-    train_complexes = complex_ids[:split_idx]
-    val_complexes = complex_ids[split_idx:]
-    
-    # 划分数据
-    train_data = data[data['#Pdb_origin'].isin(train_complexes)]
-    val_data = data[data['#Pdb_origin'].isin(val_complexes)]
-    
-    print(f"数据集划分:")
-    print(f"  训练集: {len(train_data)} 个样本, {len(train_complexes)} 个复合物")
-    print(f"  验证集: {len(val_data)} 个样本, {len(val_complexes)} 个复合物")
-    
-    return train_data, val_data
-
-
-def create_kfold_splits(data_path: str, n_splits: int = 5, random_seed: int = 42):
-    """
-    创建K折交叉验证划分
-    
-    Args:
-        data_path: 数据文件路径
-        n_splits: 折数
-        random_seed: 随机种子
-    
-    Returns:
-        生成器，产生(train_data, val_data)元组
-    """
-    from sklearn.model_selection import KFold
-    
-    # 加载数据
-    data = pd.read_csv(data_path, sep='\t')
-    
-    # 按复合物划分
-    complex_ids = data['#Pdb_origin'].unique()
-    
-    # 初始化KFold
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
-    
-    for fold, (train_complex_idx, val_complex_idx) in enumerate(kf.split(complex_ids)):
-        train_complexes = complex_ids[train_complex_idx]
-        val_complexes = complex_ids[val_complex_idx]
-        
-        # 划分数据
-        train_data = data[data['#Pdb_origin'].isin(train_complexes)]
-        val_data = data[data['#Pdb_origin'].isin(val_complexes)]
-        
-        yield fold, train_data, val_data
-
-
-def save_data_splits(train_data: pd.DataFrame, val_data: pd.DataFrame, 
-                    output_dir: str, fold: Optional[int] = None):
-    """
-    保存数据划分
-    
-    Args:
-        train_data: 训练数据
-        val_data: 验证数据
-        output_dir: 输出目录
-        fold: 折数（可选）
-    """
-    output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
-    
-    if fold is not None:
-        train_path = output_path / f'fold_{fold+1}_train.csv'
-        val_path = output_path / f'fold_{fold+1}_val.csv'
-    else:
-        train_path = output_path / 'train.csv'
-        val_path = output_path / 'val.csv'
-    
-    train_data.to_csv(train_path, sep='\t', index=False)
-    val_data.to_csv(val_path, sep='\t', index=False)
-    
-    print(f"数据划分已保存:")
-    print(f"  训练集: {train_path}")
-    print(f"  验证集: {val_path}")
 
 
 def get_data_statistics(data_path: str) -> Dict[str, Any]:
@@ -452,56 +284,3 @@ def print_data_statistics(data_path: str):
     print(f"    均值: {stats['ddg_mean']:.3f}")
     print(f"    标准差: {stats['ddg_std']:.3f}")
     print(f"    范围: [{stats['ddg_min']:.3f}, {stats['ddg_max']:.3f}]")
-
-
-# 使用示例
-if __name__ == "__main__":
-    # 示例：测试数据集功能
-    print("测试数据集功能...")
-    
-    data_path = "/home/chengwang/code/chymodel/s1131.csv"
-    pdb_base_path = "/home/chengwang/data/SKEMPI/PDBs_fixed"
-    
-    # 打印数据统计
-    print_data_statistics(data_path)
-    
-    # 测试数据加载器
-    print("\n测试数据加载器...")
-    try:
-        dataloader = create_dataloader(
-            data_path=data_path,
-            pdb_base_path=pdb_base_path,
-            batch_size=4,
-            shuffle=True,
-            use_dummy_features=True,  # 使用虚拟特征进行测试
-            num_workers=0
-        )
-        
-        print(f"数据加载器创建成功，数据集大小: {len(dataloader.dataset)}")
-        
-        # 获取一个批次的数据
-        for batch in dataloader:
-            print(f"批次大小: {batch['esm_embeddings'].shape[0]}")
-            print(f"ESM嵌入形状: {batch['esm_embeddings'].shape}")
-            print(f"FoldX特征形状: {batch['foldx_features'].shape}")
-            print(f"ΔΔG目标形状: {batch['ddg'].shape}")
-            break
-            
-    except Exception as e:
-        print(f"数据加载器测试失败: {e}")
-    
-    # 测试数据划分
-    print("\n测试数据划分...")
-    try:
-        train_data, val_data = split_dataset_by_complex(data_path, train_ratio=0.8)
-        print(f"数据划分测试成功")
-        
-        # 测试K折划分
-        print("\n测试K折划分...")
-        for fold, train_fold, val_fold in create_kfold_splits(data_path, n_splits=5):
-            print(f"折 {fold+1}: 训练集={len(train_fold)}, 验证集={len(val_fold)}")
-            if fold >= 2:  # 只测试前3折
-                break
-                
-    except Exception as e:
-        print(f"数据划分测试失败: {e}")

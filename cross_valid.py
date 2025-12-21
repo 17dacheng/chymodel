@@ -96,6 +96,10 @@ class Trainer:
             all_predictions.extend(ddg_pred.detach().cpu().numpy())
             all_targets.extend(ddg_true.detach().cpu().numpy())
         
+        # 转换为numpy数组并确保形状正确
+        all_targets = np.array(all_targets).flatten()
+        all_predictions = np.array(all_predictions).flatten()
+        
         # 计算指标
         mse = mean_squared_error(all_targets, all_predictions)
         rmse = np.sqrt(mse)
@@ -146,6 +150,10 @@ class Trainer:
                 total_loss += loss.item()
                 all_predictions.extend(ddg_pred.cpu().numpy())
                 all_targets.extend(ddg_true.cpu().numpy())
+        
+        # 转换为numpy数组并确保形状正确
+        all_targets = np.array(all_targets).flatten()
+        all_predictions = np.array(all_predictions).flatten()
         
         # 计算指标
         mse = mean_squared_error(all_targets, all_predictions)
@@ -203,7 +211,6 @@ def train_fold(
             batch_size=config.get('train_batch_size', config['batch_size']),
             shuffle=True,
             num_workers=config.get('num_workers', 4),
-            use_dummy_features=config.get('use_dummy_features', False),
             use_geometric_features=config.get('use_geometric_features', True)
         )
         
@@ -213,7 +220,6 @@ def train_fold(
             batch_size=config.get('eval_batch_size', config['batch_size']),
             shuffle=False,
             num_workers=config.get('num_workers', 4),
-            use_dummy_features=config.get('use_dummy_features', False),
             use_geometric_features=config.get('use_geometric_features', True)
         )
         
@@ -357,7 +363,6 @@ def five_fold_cross_validation(
         'num_attention_heads': 8,
         'dropout_rate': 0.1,
         'print_every': 10,
-        'use_dummy_features': False,  # 实际使用时设为False
         'use_geometric_features': True,  # 使用几何特征
         'random_seed': 42
     }
@@ -508,8 +513,7 @@ def main():
                        help='学习率')
     parser.add_argument('--device', type=str, default='cuda',
                        help='设备 (cuda/cpu)')
-    parser.add_argument('--use_dummy_features', action='store_true',
-                       help='使用虚拟特征（用于测试）')
+
     parser.add_argument('--no_geometric_features', action='store_true',
                        help='不使用几何特征')
     
@@ -524,7 +528,6 @@ def main():
         'learning_rate': args.learning_rate,
         'device': args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu',
         'pdb_base_path': args.pdb_base_path,
-        'use_dummy_features': args.use_dummy_features,
         'use_geometric_features': not args.no_geometric_features
     }
     

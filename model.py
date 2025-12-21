@@ -145,6 +145,8 @@ class InterfaceGraphData:
     atom_names: list  # [num_nodes] 每个节点对应的原子名称
     # 突变位点掩码
     is_mutation: torch.Tensor  # [num_nodes] 标记哪些节点是突变位点
+    # 残基索引列表（用于原子到残基的映射）
+    residue_indices: list  # [num_nodes] 每个原子对应的残基标识符
     
     def to(self, device):
         """将所有Tensor属性移动到指定设备"""
@@ -156,7 +158,8 @@ class InterfaceGraphData:
             node_positions=self.node_positions.to(device),
             batch=self.batch.long().to(device),  # 确保int64
             atom_names=self.atom_names,  # 非Tensor属性保持不变
-            is_mutation=self.is_mutation.to(device)
+            is_mutation=self.is_mutation.to(device),
+            residue_indices=self.residue_indices  # 非Tensor属性保持不变
         )
 
 
@@ -301,7 +304,7 @@ class GeometricGNN(nn.Module):
 
 
 class PositionAwareLayer(nn.Module):
-    """位置感知层 - 基于参考代码实现"""
+    """残基级位置感知层 - 基于GearBind实现，处理残基而非原子"""
     
     def __init__(self, hidden_dim, num_heads=4, dropout=0.1):
         super(PositionAwareLayer, self).__init__()
@@ -345,7 +348,13 @@ class PositionAwareLayer(nn.Module):
         return alpha
     
     def forward(self, x, pos_CA, pos_CB, frame, mask):
-        batch_size, seq_len, _ = x.shape
+        # x: [batch_size, num_residues, hidden_dim] - 残基级特征
+        # pos_CA: [batch_size, num_residues, 3] - 残基CA原子位置
+        # pos_CB: [batch_size, num_residues, 3] - 残基CB原子位置
+        # frame: [batch_size, num_residues, 3, 3] - 残基局部坐标系
+        # mask: [batch_size, num_residues] - 残基掩码
+        
+        batch_size, num_residues, _ = x.shape
         
         # Attention logits
         query = self._heads(self.query(x), self.num_heads, self.query_key_dim)    # (N, L, n_heads, head_size)
@@ -356,7 +365,7 @@ class PositionAwareLayer(nn.Module):
         value = self._heads(self.value(x), self.num_heads, self.value_dim)  # (N, L, n_heads, head_size)
         feat_node = torch.einsum('blkh, bkhd->blhd', alpha, value).flatten(-2)  # (N, L, hidden_dim)
         
-        # 位置相关特征
+        # 位置相关特征 - 现在基于残基位置
         rel_pos = pos_CB.unsqueeze(2) - pos_CA.unsqueeze(1)  # (N, L, L, 3)
         atom_pos_bias = torch.einsum('blkh, blkd->blhd', alpha, rel_pos)  # (N, L, n_heads, 3)
         feat_distance = atom_pos_bias.norm(dim=-1, keepdim=True)  # (N, L, n_heads, 1)
@@ -386,8 +395,177 @@ class PositionAwareLayer(nn.Module):
         return x_updated
 
 
+class AtomPositionGather(nn.Module):
+    """原子到残基的聚合模块 - 类似GearBind的AtomPositionGather"""
+    
+    def __init__(self, hidden_dim):
+        super(AtomPositionGather, self).__init__()
+        self.hidden_dim = hidden_dim
+        
+        # 原子名称到ID的映射
+        self.atom_name2id = {
+            'N': 0, 'CA': 1, 'C': 2, 'O': 3, 'CB': 4, 'CG': 5, 'CD': 6, 
+            'CE': 7, 'CZ': 8, 'OG': 9, 'OD1': 10, 'OD2': 11, 'OE1': 12,
+            'OE2': 13, 'ND1': 14, 'ND2': 15, 'NE1': 16, 'NE2': 17,
+            'NZ': 18, 'SG': 19, 'SD': 20
+        }
+        self.num_atom_types = len(self.atom_name2id)
+    
+    def forward(self, graph_data):
+        """
+        将原子级特征聚合为残基级特征
+        
+        Args:
+            graph_data: InterfaceGraphData，包含原子级信息
+            
+        Returns:
+            residue_features: [num_residues, hidden_dim] 残基级特征
+            residue_positions_CA: [num_residues, 3] CA原子位置
+            residue_positions_CB: [num_residues, 3] CB原子位置
+            residue_frames: [num_residues, 3, 3] 局部坐标系
+            atom2residue: [num_atoms] 原子到残基的映射
+            residue_mask: [num_residues] 残基完整性掩码
+        """
+        device = graph_data.node_features.device
+        num_atoms = graph_data.node_features.shape[0]
+        
+        # 1. 构建原子到残基的映射
+        atom2residue, residue_info = self._build_atom2residue_mapping(graph_data)
+        num_residues = len(residue_info)
+        
+        if num_residues == 0:
+            # 如果没有有效残基，返回空张量
+            return (torch.empty(0, self.hidden_dim, device=device),
+                   torch.empty(0, 3, device=device),
+                   torch.empty(0, 3, device=device), 
+                   torch.empty(0, 3, 3, device=device),
+                   torch.empty(0, dtype=torch.long, device=device),
+                   torch.empty(0, dtype=torch.bool, device=device))
+        
+        # 2. 验证残基完整性（包含N、CA、C原子）
+        residue_mask = self._validate_residue_completeness(atom2residue, graph_data, num_residues)
+        
+        # 3. 聚合原子特征到残基特征（只使用CA原子特征作为残基代表）
+        ca_mask = torch.tensor([name == "CA" for name in graph_data.atom_names], device=device)
+        ca_indices = torch.where(ca_mask)[0]
+        
+        if len(ca_indices) == 0:
+            # 如果没有CA原子，使用第一个原子作为代表
+            residue_features = torch.zeros(num_residues, self.hidden_dim, device=device)
+        else:
+            ca_atom2residue = atom2residue[ca_mask]
+            ca_features = graph_data.node_features[ca_mask]
+            
+            # 为每个残基分配CA原子特征
+            residue_features = torch.zeros(num_residues, self.hidden_dim, device=device)
+            for i in range(num_residues):
+                mask = ca_atom2residue == i
+                if mask.any():
+                    residue_features[i] = ca_features[mask].mean(dim=0)
+        
+        # 4. 提取CA和CB原子位置
+        residue_positions_CA, residue_positions_CB = self._extract_atom_positions(
+            atom2residue, graph_data, num_residues
+        )
+        
+        # 5. 构建局部坐标系
+        residue_frames = self._build_residue_frames(residue_positions_CA, residue_positions_CB, num_residues)
+        
+        return (residue_features, residue_positions_CA, residue_positions_CB, 
+                residue_frames, atom2residue, residue_mask)
+    
+    def _build_atom2residue_mapping(self, graph_data):
+        """构建原子到残基的映射"""
+        device = graph_data.node_features.device
+        atom2residue = torch.zeros(len(graph_data.atom_names), dtype=torch.long, device=device)
+        residue_info = {}
+        current_residue_idx = 0
+        
+        for i, residue_idx in enumerate(graph_data.residue_indices):
+            if residue_idx not in residue_info:
+                residue_info[residue_idx] = current_residue_idx
+                current_residue_idx += 1
+            atom2residue[i] = residue_info[residue_idx]
+        
+        return atom2residue, residue_info
+    
+    def _validate_residue_completeness(self, atom2residue, graph_data, num_residues):
+        """验证残基是否包含完整的N、CA、C原子"""
+        device = atom2residue.device
+        residue_mask = torch.zeros(num_residues, dtype=torch.bool, device=device)
+        
+        # 检查每个残基是否有N、CA、C原子
+        for res_idx in range(num_residues):
+            atom_mask = atom2residue == res_idx
+            if atom_mask.sum() >= 3:  # 至少3个原子
+                residue_atoms = [graph_data.atom_names[i] for i, mask in enumerate(atom_mask) if mask.item()]
+                if "N" in residue_atoms and "CA" in residue_atoms and "C" in residue_atoms:
+                    residue_mask[res_idx] = True
+        
+        return residue_mask
+    
+    def _extract_atom_positions(self, atom2residue, graph_data, num_residues):
+        """提取CA和CB原子位置"""
+        device = atom2residue.device
+        residue_positions_CA = torch.zeros(num_residues, 3, device=device)
+        residue_positions_CB = torch.zeros(num_residues, 3, device=device)
+        
+        # 提取CA原子位置
+        ca_mask = torch.tensor([name == "CA" for name in graph_data.atom_names], device=device)
+        ca_indices = torch.where(ca_mask)[0]
+        for atom_idx in ca_indices:
+            res_idx = atom2residue[atom_idx].item()
+            if res_idx < num_residues:
+                residue_positions_CA[res_idx] = graph_data.node_positions[atom_idx]
+        
+        # 提取CB原子位置（如果没有CB，使用CA位置）
+        cb_mask = torch.tensor([name == "CB" for name in graph_data.atom_names], device=device)
+        cb_indices = torch.where(cb_mask)[0]
+        for atom_idx in cb_indices:
+            res_idx = atom2residue[atom_idx].item()
+            if res_idx < num_residues:
+                residue_positions_CB[res_idx] = graph_data.node_positions[atom_idx]
+        
+        # 对于没有CB原子的残基，使用CA位置
+        no_cb_mask = (residue_positions_CB.abs().sum(dim=1) < 1e-6)
+        residue_positions_CB[no_cb_mask] = residue_positions_CA[no_cb_mask]
+        
+        return residue_positions_CA, residue_positions_CB
+    
+    def _build_residue_frames(self, pos_CA, pos_CB, num_residues):
+        """构建残基的局部坐标系"""
+        frames = torch.eye(3).unsqueeze(0).repeat(num_residues, 1, 1).to(pos_CA.device)
+        
+        # 简化的坐标系构建，使用CA和CB位置
+        for i in range(num_residues):
+            if i < len(pos_CA) - 1:
+                # 使用CA-CB向量作为x轴
+                e1 = pos_CB[i] - pos_CA[i]
+                e1_norm = e1.norm()
+                if e1_norm > 1e-6:
+                    e1 = e1 / e1_norm
+                
+                # 构建正交基
+                if e1_norm > 1e-6:
+                    # 选择一个随机向量与e1叉积得到e2
+                    temp_vec = torch.tensor([0, 0, 1], dtype=pos_CA.dtype, device=pos_CA.device)
+                    e2 = torch.cross(e1, temp_vec)
+                    e2_norm = e2.norm()
+                    if e2_norm < 1e-6:  # 如果e1和temp_vec平行
+                        temp_vec = torch.tensor([0, 1, 0], dtype=pos_CA.dtype, device=pos_CA.device)
+                        e2 = torch.cross(e1, temp_vec)
+                        e2_norm = e2.norm()
+                    
+                    if e2_norm > 1e-6:
+                        e2 = e2 / e2_norm
+                        e3 = torch.cross(e1, e2)
+                        frames[i] = torch.stack([e1, e2, e3], dim=1)
+        
+        return frames
+
+
 class GeometricMessagePassing(MessagePassing):
-    """几何感知的消息传递层 - 压缩特征维度版本，集成位置感知"""
+    """几何感知的消息传递层 - 原子级图卷积 + 残基级注意力"""
     
     def __init__(self, in_channels, out_channels, num_heads=4, dropout=0.1):
         super(GeometricMessagePassing, self).__init__()
@@ -409,7 +587,10 @@ class GeometricMessagePassing(MessagePassing):
             nn.LayerNorm(out_channels)
         )
         
-        # 位置感知层
+        # 原子到残基的聚合模块
+        self.atom_gather = AtomPositionGather(out_channels)
+        
+        # 残基级位置感知层
         self.position_aware = PositionAwareLayer(
             hidden_dim=out_channels,
             num_heads=num_heads,
@@ -428,89 +609,168 @@ class GeometricMessagePassing(MessagePassing):
         nn.init.xavier_uniform_(self.relation_weights)
     
     def forward(self, x, edge_index, edge_attr, edge_types, graph_data=None):
-        # 基础消息传递
+        # 1. 原子级图卷积
         aggr_out = self.propagate(edge_index, x=x, edge_attr=edge_attr, edge_types=edge_types)
         
-        # 更新节点特征
+        # 更新原子级节点特征
         update_input = torch.cat([x, aggr_out], dim=-1)
-        updated = self.update_proj(update_input)
+        updated_atoms = self.update_proj(update_input)  # [num_atoms, hidden_dim]
         
-        # 如果有图数据，应用位置感知处理
+        # 2. 如果有图数据，应用残基级注意力
         if graph_data is not None:
-            # 重新组织数据以适应PositionAwareLayer
-            batch_size = int(graph_data.batch.max().item() + 1)
+            # 确保graph_data有residue_indices属性
+            if not hasattr(graph_data, 'residue_indices'):
+                # 如果没有残基索引信息，直接返回原子级特征
+                return updated_atoms
             
-            # 计算每个样本的实际序列长度
-            seq_lengths = []
-            start_idx = 0
-            for i in range(batch_size):
-                if i < batch_size - 1:
-                    # 找到下一个batch的起始位置
-                    next_batch_start = (graph_data.batch == (i + 1)).nonzero(as_tuple=True)[0][0]
-                    seq_len = next_batch_start - start_idx
-                else:
-                    # 最后一个batch，使用剩余的所有节点
-                    seq_len = x.shape[0] - start_idx
-                seq_lengths.append(seq_len)
-                start_idx += seq_len
-            
-            # 使用最大序列长度进行padding和reshape
-            max_seq_len = max(seq_lengths)
-            total_nodes = x.shape[0]
-            feature_dim = updated.shape[-1]
-            
-            # 创建reshape后的tensor，用零填充
-            x_reshaped = torch.zeros(batch_size, max_seq_len, feature_dim, device=x.device)
-            
-            # 填充实际数据
-            start_idx = 0
-            for i, seq_len in enumerate(seq_lengths):
-                if seq_len > 0:  # 确保有有效数据
-                    x_reshaped[i, :seq_len, :] = updated[start_idx:start_idx + seq_len, :]
-                start_idx += seq_len
-            
-            # 创建对应的掩码
-            mask = torch.zeros(batch_size, max_seq_len, dtype=torch.bool, device=x.device)
-            for i, seq_len in enumerate(seq_lengths):
-                mask[i, :seq_len] = True
-            
-            # 提取位置信息（同样需要padding）
-            if hasattr(graph_data, 'node_positions') and graph_data.node_positions is not None:
-                pos_dim = graph_data.node_positions.shape[-1]
-                positions = torch.zeros(batch_size, max_seq_len, pos_dim, device=x.device)
-                
-                start_idx = 0
-                for i, seq_len in enumerate(seq_lengths):
-                    if seq_len > 0:
-                        positions[i, :seq_len, :] = graph_data.node_positions[start_idx:start_idx + seq_len, :]
-                    start_idx += seq_len
-            else:
-                # 如果没有位置信息，使用零向量
-                positions = torch.zeros(batch_size, max_seq_len, 3, device=x.device)
-            
-            frame = self._compute_frames(positions)
-            
-            # 提取CA和CB位置（简化处理）
-            pos_CA = positions[:, :, :3]  # 使用第一个原子作为CA
-            pos_CB = positions[:, :, :3]  # 简化：使用相同位置
-            
-            # 应用位置感知层
-            updated_pos = self.position_aware(x_reshaped, pos_CA, pos_CB, frame, mask)
-            
-            # 重新reshape回原始格式
-            start_idx = 0
-            updated_list = []
-            for i, seq_len in enumerate(seq_lengths):
-                if seq_len > 0:
-                    updated_list.append(updated_pos[i, :seq_len, :])
-                start_idx += seq_len
-            
-            if updated_list:
-                updated = torch.cat(updated_list, dim=0)
-            else:
-                updated = torch.empty(0, self.out_channels, device=x.device)
+        # 使用AtomPositionGather将原子级特征聚合为残基级特征
+        (residue_features, residue_positions_CA, residue_positions_CB, 
+         residue_frames, atom2residue, residue_mask) = self.atom_gather(graph_data)
         
-        return updated
+        if residue_features.shape[0] == 0:
+            # 如果没有有效残基，直接返回原子级特征
+            return updated_atoms
+        
+
+        
+        # 3. 残基级注意力处理
+        # 重新组织数据以适应batch处理
+        batch_size = int(graph_data.batch.max().item() + 1)
+        
+        # 将残基特征按batch分组
+        residue_features_list = []
+        residue_positions_CA_list = []
+        residue_positions_CB_list = []
+        residue_frames_list = []
+        residue_masks_list = []
+        
+        for batch_idx in range(batch_size):
+                # 找到属于当前batch的原子
+                atom_mask = graph_data.batch == batch_idx
+                
+                if atom_mask.any():
+                    # 获取这些原子对应的残基
+                    atom2residue_batch = atom2residue[atom_mask]
+                    unique_residues = torch.unique(atom2residue_batch)
+                    
+                    # 过滤完整残基
+                    valid_residues = unique_residues[residue_mask[unique_residues]]
+                    
+                    if len(valid_residues) > 0:
+                        # 提取残基级特征
+                        batch_residue_features = residue_features[valid_residues]
+                        batch_residue_positions_CA = residue_positions_CA[valid_residues]
+                        batch_residue_positions_CB = residue_positions_CB[valid_residues]
+                        batch_residue_frames = residue_frames[valid_residues]
+                        batch_residue_mask = residue_mask[valid_residues]
+                        
+                        residue_features_list.append(batch_residue_features)
+                        residue_positions_CA_list.append(batch_residue_positions_CA)
+                        residue_positions_CB_list.append(batch_residue_positions_CB)
+                        residue_frames_list.append(batch_residue_frames)
+                        residue_masks_list.append(batch_residue_mask)
+        
+        if residue_features_list:
+            # 简化处理：只处理第一个batch（对于单个样本的情况）
+            if len(residue_features_list) == 1:
+                residue_features_single = residue_features_list[0]
+                pos_CA_single = residue_positions_CA_list[0]
+                pos_CB_single = residue_positions_CB_list[0]
+                frames_single = residue_frames_list[0]
+                masks_single = residue_masks_list[0]
+                
+                # 调整为batch格式
+                batch_features = residue_features_single.unsqueeze(0)  # [1, num_residues, hidden_dim]
+                batch_pos_CA = pos_CA_single.unsqueeze(0)           # [1, num_residues, 3]
+                batch_pos_CB = pos_CB_single.unsqueeze(0)           # [1, num_residues, 3]
+                batch_frames = frames_single.unsqueeze(0)           # [1, num_residues, 3, 3]
+                batch_masks = masks_single.unsqueeze(0)            # [1, num_residues]
+                
+                # 应用残基级位置感知注意力
+                enhanced_batch_features = self.position_aware(
+                    batch_features, batch_pos_CA, batch_pos_CB, 
+                    batch_frames, batch_masks
+                )
+                
+                # 将残基级特征映射回原子级
+                updated_atoms = self._map_residue_to_atoms(
+                    updated_atoms, enhanced_batch_features, batch_masks,
+                    atom2residue, graph_data, 1
+                )
+            else:
+                # 将不同batch的残基特征padding到相同长度
+                max_residues = max(feat.shape[0] for feat in residue_features_list)
+                
+                padded_features = torch.zeros(len(residue_features_list), max_residues, 
+                                            self.out_channels, device=x.device)
+                padded_pos_CA = torch.zeros(len(residue_features_list), max_residues, 3, device=x.device)
+                padded_pos_CB = torch.zeros(len(residue_features_list), max_residues, 3, device=x.device)
+                padded_frames = torch.zeros(len(residue_features_list), max_residues, 3, 3, device=x.device)
+                padded_masks = torch.zeros(len(residue_features_list), max_residues, dtype=torch.bool, device=x.device)
+                
+                for i, (feat, pos_CA, pos_CB, frames, mask) in enumerate(zip(
+                    residue_features_list, residue_positions_CA_list, 
+                    residue_positions_CB_list, residue_frames_list, residue_masks_list)):
+                    seq_len = feat.shape[0]
+                    padded_features[i, :seq_len] = feat
+                    padded_pos_CA[i, :seq_len] = pos_CA
+                    padded_pos_CB[i, :seq_len] = pos_CB
+                    padded_frames[i, :seq_len] = frames
+                    padded_masks[i, :seq_len] = mask
+                
+                # 应用残基级位置感知注意力
+                enhanced_residue_features = self.position_aware(
+                    padded_features, padded_pos_CA, padded_pos_CB, 
+                    padded_frames, padded_masks
+                )
+                
+                # 4. 将残基级特征映射回原子级（只更新CA原子）
+                updated_atoms = self._map_residue_to_atoms(
+                    updated_atoms, enhanced_residue_features, padded_masks,
+                    atom2residue, graph_data, len(residue_features_list)
+                )
+        
+        return updated_atoms
+    
+    def _map_residue_to_atoms(self, atom_features, residue_features, residue_masks, 
+                             atom2residue, graph_data, batch_size):
+        """将残基级特征映射回原子级，只更新CA原子"""
+        device = atom_features.device
+        updated_atoms = atom_features.clone()
+        
+        # 构建原始残基索引到本地残基索引的映射
+        for batch_idx in range(batch_size):
+            atom_mask = graph_data.batch == batch_idx
+            
+            if atom_mask.any():
+                atom2residue_batch = atom2residue[atom_mask]
+                unique_residues = torch.unique(atom2residue_batch)
+                
+
+                
+                # 为每个原始残基索引找到对应的本地索引
+                local_residue_idx = 0
+                residue_idx_map = {}
+                for orig_res_idx in unique_residues:
+                    if orig_res_idx < len(residue_masks[batch_idx]) and residue_masks[batch_idx, orig_res_idx]:
+                        residue_idx_map[orig_res_idx.item()] = local_residue_idx
+                        local_residue_idx += 1
+                
+                # 更新原子特征
+                for orig_res_idx, local_idx in residue_idx_map.items():
+                    if local_idx < residue_features[batch_idx].shape[0]:
+                        # 获取残基的增强特征
+                        enhanced_feat = residue_features[batch_idx, local_idx]
+                        
+                        # 找到该残基的CA原子
+                        for atom_idx in torch.where(atom_mask)[0]:
+                            if (atom2residue[atom_idx].item() == orig_res_idx and 
+                                graph_data.atom_names[atom_idx] == "CA"):
+                                # 更新CA原子特征
+                                updated_atoms[atom_idx] = updated_atoms[atom_idx] + enhanced_feat * 0.5
+                                break
+        
+        return updated_atoms
     
     def _compute_frames(self, positions):
         """计算局部坐标系"""
@@ -576,7 +836,7 @@ class GeometricMessagePassing(MessagePassing):
 class InterfaceFeatureExtractor:
     """界面几何特征提取器 - 压缩特征维度版本，集成KNN突变位点选择"""
     
-    def __init__(self, cutoff_distance: float = 8.0, k_neighbors: int = 20, knn_mutation_k: int = 192):
+    def __init__(self, cutoff_distance: float = 8.0, k_neighbors: int = 20, knn_mutation_k: int = 256):
         self.cutoff_distance = cutoff_distance
         self.k_neighbors = k_neighbors
         self.knn_mutation_k = knn_mutation_k
@@ -717,7 +977,8 @@ class InterfaceFeatureExtractor:
             node_positions=torch.tensor(node_positions, dtype=torch.float32),
             batch=batch,
             atom_names=atom_names,
-            is_mutation=torch.tensor(is_mutation_list, dtype=torch.bool)
+            is_mutation=torch.tensor(is_mutation_list, dtype=torch.bool),
+            residue_indices=residue_indices  # 添加残基索引
         )
     
     def _atom_to_feature(self, atom, residue_frame=None, atom_positions_in_residue=None):
@@ -1421,7 +1682,8 @@ class DDGModelTester:
             node_positions=torch.tensor(node_positions, dtype=torch.float32),
             batch=batch,
             atom_names=atom_names,
-            is_mutation=torch.tensor(is_mutation_list, dtype=torch.bool)
+            is_mutation=torch.tensor(is_mutation_list, dtype=torch.bool),
+            residue_indices=residue_indices  # 添加残基索引
         )
         
 
