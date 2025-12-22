@@ -2,13 +2,16 @@
 增强的特征提取模块 - 支持多ESM模型集成和本地权重
 """
 
+import sys
 import torch
 import pickle
 import numpy as np
+import time
 from pathlib import Path
 from Bio.PDB import PDBParser
 from Bio.PDB.Polypeptide import is_aa, three_to_one
 from typing import Dict, Tuple, Optional
+from pdb import set_trace
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -42,20 +45,14 @@ class FeatureCache:
     def _load_cache(self, cache_file: Path) -> Dict:
         """加载缓存文件"""
         if cache_file.exists():
-            try:
-                with open(cache_file, 'rb') as f:
-                    return pickle.load(f)
-            except Exception as e:
-                print(f"警告: 无法加载缓存文件 {cache_file}: {e}")
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
         return {}
     
     def _save_cache(self, cache_file: Path, data: Dict):
         """保存缓存文件"""
-        try:
-            with open(cache_file, 'wb') as f:
-                pickle.dump(data, f)
-        except Exception as e:
-            print(f"错误: 无法保存缓存文件 {cache_file}: {e}")
+        with open(cache_file, 'wb') as f:
+            pickle.dump(data, f)
     
     def get_sequence_feature(self, pdb_id: str, chain: str) -> Optional[np.ndarray]:
         """获取序列特征"""
@@ -100,147 +97,109 @@ class FoldXEnergyExtractor:
         
         根据论文3.3节描述的22个能量项，从Dif_*.fxout文件解析
         """
-        try:
-            # 构建突变文件夹路径 - 格式如: 3BT1_GU131A
-            mutation_folder_name = f"{pdb_id}_{mutation_str}"
-            foldx_dir = self.pdb_base_path / mutation_folder_name
-            
-            if not foldx_dir.exists():
-                print(f"警告: FoldX文件夹不存在 {foldx_dir}")
-                return np.zeros(len(FOLDX_ENERGY_TERMS))
-            
-            # 优先使用Dif文件，它包含突变前后的能量差异
-            dif_file = foldx_dir / f"Dif_{pdb_id}_Repair.fxout"
-            if dif_file.exists():
-                return self._parse_dif_file(dif_file)
+        # 构建突变文件夹路径 - 格式如: 3BT1_GU131A
+        mutation_folder_name = f"{pdb_id}_{mutation_str}"
+        foldx_dir = self.pdb_base_path / mutation_folder_name
+        
+        if not foldx_dir.exists():
+            print(f"警告: FoldX文件夹不存在 {foldx_dir}")
+            return np.zeros(len(FOLDX_ENERGY_TERMS))
+        
+        # 优先使用Dif文件，它包含突变前后的能量差异
+        dif_file = foldx_dir / f"Dif_{pdb_id}_Repair.fxout"
+        if dif_file.exists():
+            return self._parse_dif_file(dif_file)
 
-            dif_file = foldx_dir / f"Dif_{pdb_id}_fixed_Repair.fxout"
-            if dif_file.exists():
-                return self._parse_dif_file(dif_file)
-            
-            # # 尝试其他文件
-            # avg_file = foldx_dir / f"Average_{pdb_id}_Repair.fxout"
-            # if avg_file.exists():
-            #     return self._parse_average_file(avg_file)
-            # raw_file = foldx_dir / f"Raw_{pdb_id}_Repair.fxout"
-            # if raw_file.exists():
-            #     return self._parse_raw_file(raw_file)
-            
-            print(f"警告: 未找到有效的FoldX输出文件 {pdb_id}_{mutation_str}")
-            set_trace()
-            return np.zeros(len(FOLDX_ENERGY_TERMS))
-            
-        except Exception as e:
-            print(f"错误: 提取 {pdb_id}_{mutation_str} 能量项时出错: {e}")
-            return np.zeros(len(FOLDX_ENERGY_TERMS))
+        dif_file = foldx_dir / f"Dif_{pdb_id}_fixed_Repair.fxout"
+        if dif_file.exists():
+            return self._parse_dif_file(dif_file)
+        
+        print(f"警告: 未找到有效的FoldX输出文件 {pdb_id}_{mutation_str}")
+        sys.exit()
+        return np.zeros(len(FOLDX_ENERGY_TERMS))
     
     def _parse_dif_file(self, file_path: Path) -> np.ndarray:
         """解析Dif文件 - 包含能量差异"""
-        try:
-            with open(file_path, 'r') as f:
-                content = f.read()
+        with open(file_path, 'r') as f:
+            content = f.read()
+        
+        # 查找包含能量值的行
+        lines = content.split('\n')
+        
+        # 初始化结果数组
+        energy_values = np.zeros(len(FOLDX_ENERGY_TERMS), dtype=np.float32)
+        
+        # 查找标题行和数据行
+        header_line = None
+        data_line = None
+        
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
             
-            # 查找包含能量值的行
-            lines = content.split('\n')
-            energy_values = []
+            if 'total energy' in line.lower():
+                # 找到标题行
+                header_line = line
+            elif '.pdb' in line:
+                # 找到数据行
+                data_line = line
+                
+            if header_line and data_line:
+                break
+        
+        if header_line and data_line:
+            # 处理标题行
+            header_parts = header_line.split('\t')
+            header_map = {}
+            for i, header in enumerate(header_parts):
+                header_map[header.lower()] = i
             
-            for line in lines:
-                line = line.strip()
-                if not line or line.startswith('#') or 'total' in line.lower():
-                    continue
-                
-                # 尝试提取数值
-                parts = line.split()
-                numeric_parts = []
-                
-                for part in parts:
-                    try:
-                        # 处理科学计数法
-                        if 'e' in part.lower():
-                            value = float(part)
-                        else:
-                            # 尝试直接转换
-                            value = float(part)
-                        numeric_parts.append(value)
-                    except ValueError:
-                        continue
-                
-                if len(numeric_parts) >= len(FOLDX_ENERGY_TERMS):
-                    energy_values = numeric_parts[:len(FOLDX_ENERGY_TERMS)]
-                    break
+            # 处理数据行
+            data_parts = data_line.split()
             
-            if energy_values:
-                return np.array(energy_values, dtype=np.float32)
-            else:
-                # 如果解析失败，尝试从文件内容中搜索数值
-                return self._search_energy_values(content)
-                
-        except Exception as e:
-            print(f"错误: 解析Dif文件 {file_path} 时出错: {e}")
-            return np.zeros(len(FOLDX_ENERGY_TERMS))
-    
+            # 提取每个能量项的值
+            for i, term in enumerate(FOLDX_ENERGY_TERMS):
+                # 将能量项名称转换为与文件中一致的格式
+                normalized_term = term.replace('_', ' ').lower()
+
+                for header, idx in header_map.items():
+                    if normalized_term in header:
+                        # 确保索引在数据范围内
+                        if idx < len(data_parts):
+                            try:
+                                energy_values[i] = float(data_parts[idx])
+                            except (ValueError, IndexError):
+                                # 如果转换失败，保持默认值0
+                                pass
+                        break
+            return energy_values
+        set_trace()
+        return None
+
     def _parse_average_file(self, file_path: Path) -> np.ndarray:
         """解析Average文件"""
-        try:
-            with open(file_path, 'r') as f:
-                lines = f.readlines()
-            
-            # 查找包含数值的行
-            for line in lines:
-                if 'total energy' in line.lower() or 'energy' in line.lower():
-                    parts = line.split()
-                    numeric_values = []
-                    for part in parts:
-                        try:
-                            numeric_values.append(float(part))
-                        except ValueError:
-                            continue
-                    if len(numeric_values) >= len(FOLDX_ENERGY_TERMS):
-                        return np.array(numeric_values[:len(FOLDX_ENERGY_TERMS)], dtype=np.float32)
-            
-            return np.zeros(len(FOLDX_ENERGY_TERMS))
-            
-        except Exception as e:
-            print(f"错误: 解析Average文件 {file_path} 时出错: {e}")
-            return np.zeros(len(FOLDX_ENERGY_TERMS))
+        with open(file_path, 'r') as f:
+            lines = f.readlines()
+        
+        # 查找包含数值的行
+        for line in lines:
+            if 'total energy' in line.lower() or 'energy' in line.lower():
+                parts = line.split()
+                numeric_values = []
+                for part in parts:
+                    numeric_values.append(float(part))
+                if len(numeric_values) >= len(FOLDX_ENERGY_TERMS):
+                    return np.array(numeric_values[:len(FOLDX_ENERGY_TERMS)], dtype=np.float32)
+        
+        return np.zeros(len(FOLDX_ENERGY_TERMS))
     
     def _parse_raw_file(self, file_path: Path) -> np.ndarray:
         """解析Raw文件"""
-        try:
-            with open(file_path, 'r') as f:
-                content = f.read()
-            
-            return self._search_energy_values(content)
-            
-        except Exception as e:
-            print(f"错误: 解析Raw文件 {file_path} 时出错: {e}")
-            return np.zeros(len(FOLDX_ENERGY_TERMS))
-    
-    def _search_energy_values(self, content: str) -> np.ndarray:
-        """从文件内容中搜索能量值"""
-        import re
+        with open(file_path, 'r') as f:
+            content = f.read()
         
-        energy_values = []
-        
-        # 查找所有浮点数
-        numbers = re.findall(r'[-+]?\d*\.\d+[eE]?[-+]?\d*', content)
-        numeric_values = []
-        
-        for num in numbers:
-            try:
-                numeric_values.append(float(num))
-            except ValueError:
-                continue
-        
-        # 取前n个数值
-        if len(numeric_values) >= len(FOLDX_ENERGY_TERMS):
-            energy_values = numeric_values[:len(FOLDX_ENERGY_TERMS)]
-        else:
-            # 如果数值不够，用零填充
-            energy_values = numeric_values + [0.0] * (len(FOLDX_ENERGY_TERMS) - len(numeric_values))
-        
-        return np.array(energy_values, dtype=np.float32)
-
+        return self._search_energy_values(content)
 
 class RealFeatureExtractor:
     """真实特征提取器 - 整合序列和能量项提取"""
@@ -274,6 +233,7 @@ class RealFeatureExtractor:
         
         # 提取序列特征（如果不在缓存中）
         if seq_feature is None:
+            start_time = time.time()
             pdb_file = self._find_pdb_file(pdb_id, mutation_str)
             if pdb_file:
                 seq_feature = self._extract_sequence_embedding(pdb_file, chain)
@@ -281,69 +241,60 @@ class RealFeatureExtractor:
             else:
                 print(f"  警告: 未找到PDB文件 {pdb_id}_{mutation_str}，使用默认序列特征")
                 seq_feature = self._get_default_sequence_features()
+            seq_time = time.time() - start_time
+            print(f"  ESM序列特征提取时间: {seq_time:.3f}秒")
+        else:
+            print(f"  ESM序列特征从缓存加载")
         
         # 提取能量项特征（如果不在缓存中）
         if energy_feature is None:
+            start_time = time.time()
             energy_feature = self.energy_extractor.extract_energy_features(pdb_id, mutation_str)
             self.cache.save_energy_feature(pdb_id, mutation, energy_feature)
+            foldx_time = time.time() - start_time
+            print(f"  FoldX能量项提取时间: {foldx_time:.3f}秒")
+        else:
+            print(f"  FoldX能量项从缓存加载")
         
         return seq_feature, energy_feature
     
     def _extract_sequence_embedding(self, pdb_file: str, chain: str) -> np.ndarray:
         """从PDB文件提取序列嵌入"""
-        try:
-            sequence = self._extract_sequence_from_pdb(pdb_file, chain)
-            return self._get_simple_sequence_features(sequence)
-        except Exception as e:
-            print(f"错误: 提取序列特征时出错: {e}")
-            return self._get_default_sequence_features()
+        sequence = self._extract_sequence_from_pdb(pdb_file, chain)
+        return self._get_simple_sequence_features(sequence)
     
     def _extract_sequence_from_pdb(self, pdb_file: str, chain: str) -> str:
         """从PDB文件提取序列"""
-        try:
-            parser = PDBParser(QUIET=True)
-            structure = parser.get_structure('protein', pdb_file)
-            
-            sequence = ""
-            for model in structure:
-                for chain_obj in model:
-                    if chain_obj.id == chain:
-                        for residue in chain_obj:
-                            if is_aa(residue, standard=True):
-                                try:
-                                    resname = residue.get_resname()
-                                    sequence += three_to_one(resname)
-                                except Exception:
-                                    continue
-            return sequence
-            
-        except ImportError:
-            print("警告: Biopython未安装，使用简单PDB解析")
-            return self._simple_pdb_sequence_extraction(pdb_file, chain)
-        except Exception as e:
-            print(f"错误: 解析PDB文件时出错: {e}")
-            return ""
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure('protein', pdb_file)
+        
+        sequence = ""
+        for model in structure:
+            for chain_obj in model:
+                if chain_obj.id == chain:
+                    for residue in chain_obj:
+                        if is_aa(residue, standard=True):
+                            resname = residue.get_resname()
+                            sequence += three_to_one(resname)
+        return sequence
     
     def _simple_pdb_sequence_extraction(self, pdb_file: str, chain: str) -> str:
         """简单的PDB序列提取（不依赖Biopython）"""
         sequence = ""
-        try:
-            with open(pdb_file, 'r') as f:
-                for line in f:
-                    if line.startswith('ATOM'):
-                        if line[21] == chain:
-                            resname = line[17:20].strip()
-                            aa_map = {
-                                'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D',
-                                'CYS': 'C', 'GLN': 'Q', 'GLU': 'E', 'GLY': 'G',
-                                'HIS': 'H', 'ILE': 'I', 'LEU': 'L', 'LYS': 'K',
-                                'MET': 'M', 'PHE': 'F', 'PRO': 'P', 'SER': 'S',
-                                'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V'
-                            }
-                            if resname in aa_map:
-                                sequence += aa_map[resname]
-        except Exception as e:
-            print(f"简单PDB解析失败: {e}")
+        with open(pdb_file, 'r') as f:
+            for line in f:
+                if line.startswith('ATOM'):
+                    if line[21] == chain:
+                        resname = line[17:20].strip()
+                        aa_map = {
+                            'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D',
+                            'CYS': 'C', 'GLN': 'Q', 'GLU': 'E', 'GLY': 'G',
+                            'HIS': 'H', 'ILE': 'I', 'LEU': 'L', 'LYS': 'K',
+                            'MET': 'M', 'PHE': 'F', 'PRO': 'P', 'SER': 'S',
+                            'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V'
+                        }
+                        if resname in aa_map:
+                            sequence += aa_map[resname]
         return sequence
     
     def _get_simple_sequence_features(self, sequence: str) -> np.ndarray:

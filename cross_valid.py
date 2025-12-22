@@ -1,5 +1,4 @@
 """
-CHYModel训练和评估脚本
 五折交叉验证训练框架
 """
 
@@ -31,7 +30,6 @@ class Trainer:
         model: nn.Module,
         device: torch.device,
         learning_rate: float = 1e-3,
-        weight_decay: float = 1e-5,
         patience: int = 20
     ):
         self.model = model.to(device)
@@ -39,8 +37,7 @@ class Trainer:
         self.criterion = nn.MSELoss()
         self.optimizer = optim.Adam(
             model.parameters(), 
-            lr=learning_rate, 
-            weight_decay=weight_decay
+            lr=learning_rate
         )
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, 
@@ -60,7 +57,7 @@ class Trainer:
         all_predictions = []
         all_targets = []
         
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             # 将数据移到设备
             esm_emb = batch['esm_embeddings'].to(self.device)
             foldx_feat = batch['foldx_features'].to(self.device)
@@ -91,8 +88,16 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
             
+            # 打印每个batch的训练损失
+            batch_loss = loss.item()
+            total_loss += batch_loss
+            
+            # 处理批量预测值和真实值
+            pred_mean = ddg_pred.mean().item()
+            true_mean = ddg_true.mean().item()
+            print(f"  Batch {batch_idx+1}/{len(train_loader)} | Loss: {batch_loss:.6f} | Predicted: {pred_mean:.4f} | True: {true_mean:.4f}")
+            
             # 记录指标
-            total_loss += loss.item()
             all_predictions.extend(ddg_pred.detach().cpu().numpy())
             all_targets.extend(ddg_true.detach().cpu().numpy())
         
@@ -121,7 +126,7 @@ class Trainer:
         all_targets = []
         
         with torch.no_grad():
-            for batch in val_loader:
+            for batch_idx, batch in enumerate(val_loader):
                 # 将数据移到设备
                 esm_emb = batch['esm_embeddings'].to(self.device)
                 foldx_feat = batch['foldx_features'].to(self.device)
@@ -146,8 +151,16 @@ class Trainer:
                 
                 loss = self.criterion(ddg_pred, ddg_true)
                 
+                # 打印验证batch的损失
+                batch_loss = loss.item()
+                total_loss += batch_loss
+                
+                # 处理批量预测值和真实值
+                pred_mean = ddg_pred.mean().item()
+                true_mean = ddg_true.mean().item()
+                print(f"  Val Batch {batch_idx+1}/{len(val_loader)} | Loss: {batch_loss:.6f} | Predicted: {pred_mean:.4f} | True: {true_mean:.4f}")
+                
                 # 记录指标
-                total_loss += loss.item()
                 all_predictions.extend(ddg_pred.cpu().numpy())
                 all_targets.extend(ddg_true.cpu().numpy())
         
@@ -232,15 +245,13 @@ def train_fold(
             foldx_dim=config.get('foldx_features', 22),
             hidden_dim=config.get('hidden_dims', [512, 256, 128])[0],
             num_heads=config.get('num_attention_heads', 8),
-            num_layers=config.get('num_attention_layers', 2),
-            dropout=config.get('dropout_rate', 0.1)
+            num_layers=config.get('num_attention_layers', 2)
         )
 
         trainer = Trainer(
             model=model,
             device=device,
             learning_rate=config.get('learning_rate', 1e-3),
-            weight_decay=config.get('weight_decay', 1e-5),
             patience=config.get('patience', 20)
         )
         
@@ -252,9 +263,13 @@ def train_fold(
         for epoch in range(config['num_epochs']):
             start_time = time.time()
             
+            print(f"\nEpoch {epoch+1}/{config['num_epochs']}")
+            print("=" * 50)
+            print("Training:")
             # 训练
             train_metrics = trainer.train_epoch(train_loader)
             
+            print("\nValidation:")
             # 验证
             val_metrics, val_pred, val_true = trainer.validate(val_loader)
             
@@ -275,19 +290,18 @@ def train_fold(
                 best_metrics['predictions'] = val_pred
                 best_metrics['targets'] = val_true
             
-            # 打印进度
+            # 打印epoch级别总结
             epoch_time = time.time() - start_time
-            if (epoch + 1) % config.get('print_every', 10) == 0:
-                print(f"Epoch {epoch+1:3d}/{config['num_epochs']} | "
-                      f"Time: {epoch_time:.1f}s | "
-                      f"Train Loss: {train_metrics['loss']:.4f} | "
-                      f"Val Loss: {val_metrics['loss']:.4f} | "
-                      f"Val RMSE: {val_metrics['rmse']:.4f} | "
-                      f"Val R²: {val_metrics['r2']:.4f} | "
-                      f"Val Pearson: {val_metrics['pearson_corr']:.4f}")
+            print(f"\nEpoch {epoch+1} Summary:")
+            print(f"  Time: {epoch_time:.1f}s | "
+                  f"Avg Train Loss: {train_metrics['loss']:.4f} | "
+                  f"Avg Val Loss: {val_metrics['loss']:.4f} | "
+                  f"Val RMSE: {val_metrics['rmse']:.4f} | "
+                  f"Val R²: {val_metrics['r2']:.4f} | "
+                  f"Val Pearson: {val_metrics['pearson_corr']:.4f}")
             
             if stop_early:
-                print(f"早停在 epoch {epoch+1}")
+                print(f"\n早停在 epoch {epoch+1}")
                 break
         
         # 加载最佳模型进行最终评估
@@ -356,12 +370,10 @@ def five_fold_cross_validation(
         'eval_batch_size': 16,
         'num_epochs': 100,
         'learning_rate': 1e-3,
-        'weight_decay': 1e-5,
         'patience': 20,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'num_attention_layers': 2,
         'num_attention_heads': 8,
-        'dropout_rate': 0.1,
         'print_every': 10,
         'use_geometric_features': True,  # 使用几何特征
         'random_seed': 42
@@ -513,7 +525,6 @@ def main():
                        help='学习率')
     parser.add_argument('--device', type=str, default='cuda',
                        help='设备 (cuda/cpu)')
-
     parser.add_argument('--no_geometric_features', action='store_true',
                        help='不使用几何特征')
     

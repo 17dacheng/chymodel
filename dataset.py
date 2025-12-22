@@ -1,5 +1,4 @@
 """
-ComplexDDG数据处理模块
 包含数据集定义和数据加载相关函数
 """
 import sys
@@ -35,11 +34,7 @@ def custom_collate_fn(batch):
             # 使用默认的tensor处理
             values = [item[key] for item in batch if item[key] is not None]
             if len(values) > 0:
-                try:
-                    collated_batch[key] = torch.utils.data.default_collate(values)
-                except:
-                    # 如果默认collate失败，直接使用列表
-                    collated_batch[key] = values
+                collated_batch[key] = torch.utils.data.default_collate(values)
             else:
                 collated_batch[key] = None
     
@@ -134,7 +129,7 @@ class SKEMPIDataset(Dataset):
         if use_geometric_features:
             self.geometric_tester = DDGModelTester(
                 pdb_base_path=pdb_base_path,
-                cache_dir=str(self.cache_dir) + "_geometric",
+                cache_dir=self.cache_dir,
                 use_geometric=True
             )
         else:
@@ -226,6 +221,11 @@ def create_dataloader(
     Returns:
         DataLoader对象
     """
+    # 当使用CUDA时，自动设置num_workers=0以避免fork问题
+    if torch.cuda.is_available() and num_workers > 0:
+        print(f"警告: 检测到CUDA环境，自动将num_workers从{num_workers}设置为0以避免multiprocessing问题")
+        num_workers = 0
+    
     dataset = SKEMPIDataset(
         data_path=data_path,
         pdb_base_path=pdb_base_path,
