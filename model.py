@@ -32,28 +32,28 @@ class CHYModelWithGeometric(nn.Module):
         self.foldx_dim = foldx_dim
         self.geometric_dim = geometric_dim
         
-        # FoldX特征投影
+        # FoldX特征投影 - 降低维度
         self.foldx_projection = nn.Sequential(
-            nn.Linear(foldx_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
+            nn.Linear(foldx_dim, hidden_dim // 4),
+            nn.LayerNorm(hidden_dim // 4),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 128),  # 输出128维特征
-            nn.LayerNorm(128),
+            nn.Linear(hidden_dim // 4, 64),  # 降低到64维特征
+            nn.LayerNorm(64),
             nn.ReLU()
         )
         
-        # ESM特征处理
+        # ESM特征处理 - 降低维度
         self.esm_projection = nn.Sequential(
-            nn.Linear(esm_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(esm_dim, hidden_dim // 4),  # 降低到128维
+            nn.LayerNorm(hidden_dim // 4),
             nn.ReLU()
         )
         
         # Transformer编码器
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 2,
+            d_model=hidden_dim // 4,  # 降低到128维
+            nhead=num_heads // 2,     # 减少注意力头数
+            dim_feedforward=hidden_dim // 2,
             dropout=0,  # 不使用dropout
             batch_first=True
         )
@@ -62,48 +62,48 @@ class CHYModelWithGeometric(nn.Module):
             num_layers=num_layers
         )
         
-        # 几何特征处理（GearBind-inspired）- 压缩维度
+        # 几何特征处理（GearBind-inspired）- 增强特征维度
         self.geometric_gnn_wt = SimplifiedGeometricGNN(
-            node_feat_dim=64,   # 64维输入
-            edge_feat_dim=64,   # 64维边特征
-            hidden_dim=64,       # 64维隐藏层
+            node_feat_dim=96,   # 96维原子特征输入
+            edge_feat_dim=96,   # 96维边特征
+            hidden_dim=96,       # 96维隐藏层
             num_heads=4
         )
         
         # 为突变体也创建一个GNN（需要这个变量）
         self.geometric_gnn_mt = SimplifiedGeometricGNN(
-            node_feat_dim=64,   # 64维输入
-            edge_feat_dim=64,   # 64维边特征
-            hidden_dim=64,       # 64维隐藏层
+            node_feat_dim=96,   # 96维原子特征输入
+            edge_feat_dim=96,   # 96维边特征
+            hidden_dim=96,       # 96维隐藏层
             num_heads=4
         )
         
-        # 特征融合层 - 调整输入维度
+        # 特征融合层 - 降低特征维度
         self.feature_fusion = nn.Sequential(
             nn.Linear(
-                hidden_dim + 128 + 16 + 16,  # seq_rep + foldx_expanded + wt_geom_rep + mt_geom_rep = 512 + 128 + 16 + 16 = 672
-                hidden_dim * 2
+                hidden_dim // 4 + 64 + 128 + 128,  # seq_rep + foldx_expanded + wt_geom_rep + mt_geom_rep = 128 + 64 + 128 + 128 = 448
+                hidden_dim // 2
             ),
-            nn.LayerNorm(hidden_dim * 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.LayerNorm(hidden_dim // 4),
             nn.ReLU()
         )
         
         # 对称性处理（类似GearBind的Anti-symmetric处理）
         self.antisymmetric_layer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim // 4, hidden_dim // 4),
+            nn.LayerNorm(hidden_dim // 4),
             nn.Tanh()
         )
         
         # 回归头
         self.regression_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
+            nn.Linear(hidden_dim // 4, hidden_dim // 8),
+            nn.LayerNorm(hidden_dim // 8),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(hidden_dim // 8, 1)
         )
         
         # 初始化权重
@@ -152,7 +152,7 @@ class CHYModelWithGeometric(nn.Module):
         
         # 2. 处理ESM特征
         esm_start = time.time()
-        esm_proj = self.esm_projection(esm_embeddings)  # [batch_size, seq_len, hidden_dim]
+        esm_proj = self.esm_projection(esm_embeddings)  # [batch_size, seq_len, hidden_dim//4]
         esm_time = time.time() - esm_start
         
         # 3. Transformer编码
@@ -165,10 +165,10 @@ class CHYModelWithGeometric(nn.Module):
         transformer_output = self.transformer_encoder(
             esm_proj,
             src_key_padding_mask=src_key_padding_mask if attention_mask is not None else None
-        )  # [batch_size, seq_len, hidden_dim]
+        )  # [batch_size, seq_len, hidden_dim//4=128]
         
         # 全局平均池化
-        seq_rep = transformer_output.mean(dim=1)  # [batch_size, hidden_dim]
+        seq_rep = transformer_output.mean(dim=1)  # [batch_size, hidden_dim//4]
         
         # 4. 处理几何特征（WT和MT分别处理）
         geom_start = time.time()
@@ -190,37 +190,30 @@ class CHYModelWithGeometric(nn.Module):
             wt_geom_rep = wt_geom_rep[0:1].expand(batch_size, -1)
             mt_geom_rep = mt_geom_rep[0:1].expand(batch_size, -1)  # 同样使用WT部分
         
-        # 扩展几何特征到合适维度（如果需要）
-        if wt_geom_rep.shape[-1] < 16:
-            # 将16维扩展到合适维度
-            geom_expansion = nn.Linear(wt_geom_rep.shape[-1], 16).to(seq_rep.device)
-            wt_geom_rep = geom_expansion(wt_geom_rep)
-            mt_geom_rep = geom_expansion(mt_geom_rep)
+        # 确保几何特征维度正确（当前已经是128维）
+        # 几何特征已经通过SimplifiedGeometricGNN输出为128维
         
-        # 扩展FoldX特征到合适维度
-        if foldx_proj.shape[-1] < 128:
-            foldx_expansion = nn.Linear(foldx_proj.shape[-1], 128).to(seq_rep.device)
+        # 确保FoldX特征维度正确
+        if foldx_proj.shape[-1] != 64:
+            foldx_expansion = nn.Linear(foldx_proj.shape[-1], 64).to(seq_rep.device)
             foldx_expanded = foldx_expansion(foldx_proj)
         else:
             foldx_expanded = foldx_proj
         
         # 拼接所有特征
         combined_features = torch.cat([
-            seq_rep,  # 序列特征 [batch_size, hidden_dim=512]
-            foldx_expanded,  # FoldX特征 [batch_size, 128]
-            wt_geom_rep,  # WT几何特征 [batch_size, 16]
-            mt_geom_rep   # MT几何特征 [batch_size, 16]
-        ], dim=-1)  # [batch_size, 512 + 128 + 16 + 16 = 672]
-        
-        
-
-        
-        fused_features = self.feature_fusion(combined_features)  # [batch_size, hidden_dim]
+            seq_rep,  # 序列特征 [batch_size, hidden_dim//4=128]
+            foldx_expanded,  # FoldX特征 [batch_size, 64]
+            wt_geom_rep,  # WT几何特征 [batch_size, 128]
+            mt_geom_rep   # MT几何特征 [batch_size, 128]
+        ], dim=-1)  # [batch_size, 128 + 64 + 128 + 128 = 448]
+                
+        fused_features = self.feature_fusion(combined_features)  # [batch_size, hidden_dim//4]
         
         # 6. 对称性处理（ΔΔG应该是反对称的）
         antisym_features = self.antisymmetric_layer(fused_features)
         # 通过WT和MT特征的差异来实现反对称性
-        geom_diff = mt_geom_rep - wt_geom_rep  # [batch_size, 16]
+        geom_diff = mt_geom_rep - wt_geom_rep  # [batch_size, 128]
         
         # 扩展几何差异到与antisym_features相同的维度
         if geom_diff.shape[-1] != antisym_features.shape[-1]:
@@ -418,7 +411,7 @@ class DDGModelTester:
         residue_frames, residue_atom_positions = build_unified_residue_frames(all_residues)
         
         # 创建UnifiedResidueGeometry实例（只需要创建一次）
-        atom_position_gather = UnifiedResidueGeometry(hidden_dim=64)
+        atom_position_gather = UnifiedResidueGeometry(hidden_dim=96)
         
         for residue in all_residues:
             # 为每个残基的原子创建节点
@@ -551,8 +544,8 @@ class DDGModelTester:
                 edge_sources.extend([i, j])
                 edge_targets.extend([j, i])
                 
-                # 构建64维边特征
-                edge_feat = np.zeros(64)  # 压缩到64维
+                # 构建96维边特征 (从64提升到96)
+                edge_feat = np.zeros(96)  # 提升到96维
                 
                 # 1. 基础距离特征 (0-2)
                 edge_feat[0] = dist
@@ -577,17 +570,19 @@ class DDGModelTester:
                 edge_feat[9 + aa_idx_i] = 1.0
                 edge_feat[19 + aa_idx_j] = 1.0  # 简化位置分配
                 
-                # 5. 简化的几何编码特征 (29-63)
-                for k in range(6):  # 从21减少到6
+                # 5. 增强的几何编码特征 (29-95) - 扩展到96维
+                for k in range(8):  # 从6增加到8，提供更丰富的几何编码
                     freq = (k + 1) * np.pi
-                    idx = 29 + k * 6
-                    if idx + 5 < 64:
+                    idx = 29 + k * 8  # 每个频率使用8维而不是6维
+                    if idx + 7 < 96:
                         edge_feat[idx] = np.sin(dist * freq)
                         edge_feat[idx + 1] = np.cos(dist * freq)
                         edge_feat[idx + 2] = np.sin(dist * freq * 2)
                         edge_feat[idx + 3] = np.cos(dist * freq * 2)
                         edge_feat[idx + 4] = np.sin(dist * freq * 3)
                         edge_feat[idx + 5] = np.cos(dist * freq * 3)
+                        edge_feat[idx + 6] = np.sin(dist * freq * 4)  # 新增更高频编码
+                        edge_feat[idx + 7] = np.cos(dist * freq * 4)  # 新增更高频编码
                 
                 edge_features_list.extend([edge_feat, edge_feat])
                 edge_types_list.extend([edge_type, edge_type])
@@ -702,9 +697,9 @@ class DDGModelTester:
                 if hasattr(self.model, 'forward') and 'wt_graph_data' in self.model.forward.__code__.co_varnames:
                     # 如果模型需要几何参数但几何特征缺失，创建空的图数据
                     dummy_graph_data = InterfaceGraphData(
-                        node_features=torch.zeros(1, 64, device=self.device),  # 压缩到64维
+                        node_features=torch.zeros(1, 96, device=self.device),  # 提升到96维
                         edge_index=torch.zeros(2, 1, dtype=torch.long, device=self.device),
-                        edge_features=torch.zeros(1, 64, device=self.device),   # 压缩到64维
+                        edge_features=torch.zeros(1, 96, device=self.device),   # 提升到96维
                         edge_types=torch.zeros(1, dtype=torch.long, device=self.device),
                         node_positions=torch.zeros(1, 3, device=self.device),
                         batch=torch.zeros(1, dtype=torch.long, device=self.device),

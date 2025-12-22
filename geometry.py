@@ -86,7 +86,7 @@ class UnifiedResidueGeometry(nn.Module):
     合并了 AtomPositionGather 和 PositionAwareLayer 的功能
     """
     
-    def __init__(self, hidden_dim=64, num_heads=4):
+    def __init__(self, hidden_dim=96, num_heads=4):
         super(UnifiedResidueGeometry, self).__init__()
         
         self.hidden_dim = hidden_dim
@@ -212,12 +212,13 @@ class UnifiedResidueGeometry(nn.Module):
             pos_encoding           # 剩余维度
         ], dim=0)
         
-        # 确保特征维度为64
-        if atom_feature.shape[0] < 64:
-            padding = torch.zeros(64 - atom_feature.shape[0], device='cpu')
+        # 确保特征维度为96 (从64提升到96)
+        target_dim = 96
+        if atom_feature.shape[0] < target_dim:
+            padding = torch.zeros(target_dim - atom_feature.shape[0], device='cpu')
             atom_feature = torch.cat([atom_feature, padding], dim=0)
-        elif atom_feature.shape[0] > 64:
-            atom_feature = atom_feature[:64]
+        elif atom_feature.shape[0] > target_dim:
+            atom_feature = atom_feature[:target_dim]
         
         return atom_feature
     
@@ -350,7 +351,7 @@ class UnifiedGeometricProcessor(nn.Module):
     合并了 KNNMutationSite, InterfaceFeatureExtractor, 和部分几何处理功能
     """
     
-    def __init__(self, hidden_dim=64, cutoff_distance=8.0, k_neighbors=20, knn_mutation_k=256, num_heads=4):
+    def __init__(self, hidden_dim=96, cutoff_distance=8.0, k_neighbors=20, knn_mutation_k=256, num_heads=4):
         super(UnifiedGeometricProcessor, self).__init__()
         
         self.cutoff_distance = cutoff_distance
@@ -461,7 +462,7 @@ class SimplifiedGeometricGNN(nn.Module):
     统一了 GeometricMessagePassing 和 GeometricGNN 的功能
     """
     
-    def __init__(self, node_feat_dim=64, edge_feat_dim=64, hidden_dim=64, num_heads=4):
+    def __init__(self, node_feat_dim=96, edge_feat_dim=96, hidden_dim=96, num_heads=4):
         super(SimplifiedGeometricGNN, self).__init__()
         
         self.hidden_dim = hidden_dim
@@ -495,12 +496,12 @@ class SimplifiedGeometricGNN(nn.Module):
             nn.ReLU()
         )
         
-        # 输出投影
+        # 输出投影 - 增强几何特征表达能力  
         self.output_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
+            nn.Linear(hidden_dim, 128),
+            nn.LayerNorm(128),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4)
+            nn.Linear(128, 128)  # 提升到128维几何特征输出
         )
     
     def forward(self, graph_data: InterfaceGraphData) -> torch.Tensor:
