@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.nn import global_mean_pool, MessagePassing
 import numpy as np
+from torch_cluster import knn
 from dataclasses import dataclass
 
 
@@ -412,7 +413,7 @@ class UnifiedGeometricProcessor(nn.Module):
         }
     
     def apply_knn_selection(self, node_positions_tensor, atom_names, is_mutation_tensor, batch):
-        """应用KNN突变位点选择"""
+        """应用KNN突变位点选择 - 完全优化的GearBind方法"""
         device = node_positions_tensor.device
         
         # 找到突变位点的CA原子
@@ -422,36 +423,26 @@ class UnifiedGeometricProcessor(nn.Module):
         if not mutation_ca_mask.any():
             return torch.ones(len(atom_names), dtype=torch.bool, device=device)
         
-        # 计算距离并选择最近的k个节点
         center_positions = node_positions_tensor[mutation_ca_mask]
         mut2graph = batch[mutation_ca_mask]
         
-        center_indices = nearest(node_positions_tensor, center_positions, batch, mut2graph)
-        dist_to_center = ((node_positions_tensor - center_positions[center_indices])**2).sum(-1)
-        dist_to_center[mutation_ca_mask] = 0.0
-        
-        # 为每个batch选择最近的k个节点
-        num_graphs = batch.max().item() + 1
-        selected_indices = []
-        
-        for graph_id in range(num_graphs):
-            graph_mask = batch == graph_id
-            graph_nodes = torch.where(graph_mask)[0]
+        # GearBind完全优化方法: 一次性处理所有突变位点
+        k_select = min(self.knn_k, len(node_positions_tensor))
+        if len(center_positions) > 0 and len(node_positions_tensor) > k_select:
+            # 使用GearBind风格 - 直接调用knn处理所有中心点
+            knn_indices = knn(node_positions_tensor, center_positions, k_select, batch, mut2graph)
+            # knn_indices shape: [num_centers, k]
             
-            if len(graph_nodes) <= self.knn_k:
-                selected_indices.append(graph_nodes)
-            else:
-                graph_distances = dist_to_center[graph_mask]
-                _, local_selected = torch.topk(graph_distances, self.knn_k, largest=False)
-                global_selected = graph_nodes[local_selected]
-                selected_indices.append(global_selected)
+            # 合并所有选中的索引
+            selected = knn_indices.flatten()
+            # 包含突变位点本身
+            mutation_indices = torch.where(mutation_ca_mask)[0]
+            all_selected = torch.unique(torch.cat([selected, mutation_indices]))
+        else:
+            all_selected = torch.arange(len(atom_names), device=device)
         
-        # 创建节点掩码
         node_mask = torch.zeros(len(atom_names), dtype=torch.bool, device=device)
-        if selected_indices:
-            all_selected = torch.cat(selected_indices)
-            node_mask[all_selected] = True
-        
+        node_mask[all_selected] = True
         return node_mask
 
 
@@ -528,45 +519,41 @@ class SimplifiedGeometricGNN(nn.Module):
         
         # 残基级几何处理（如果有足够的数据）
         if len(graph_data.residue_indices) > 0:
-            try:
-                residue_features, pos_CA, pos_CB, atom2residue = self.geometric_processor.aggregate_atoms_to_residues(
-                    InterfaceGraphData(
-                        node_features=updated_x,
-                        edge_index=graph_data.edge_index,
-                        edge_features=graph_data.edge_features,
-                        edge_types=graph_data.edge_types,
-                        node_positions=graph_data.node_positions,
-                        batch=graph_data.batch,
-                        atom_names=graph_data.atom_names,
-                        is_mutation=graph_data.is_mutation,
-                        residue_indices=graph_data.residue_indices
-                    )
+            residue_features, pos_CA, pos_CB, atom2residue = self.geometric_processor.aggregate_atoms_to_residues(
+                InterfaceGraphData(
+                    node_features=updated_x,
+                    edge_index=graph_data.edge_index,
+                    edge_features=graph_data.edge_features,
+                    edge_types=graph_data.edge_types,
+                    node_positions=graph_data.node_positions,
+                    batch=graph_data.batch,
+                    atom_names=graph_data.atom_names,
+                    is_mutation=graph_data.is_mutation,
+                    residue_indices=graph_data.residue_indices
                 )
-                
-                if residue_features.shape[0] > 0:
-                    # 重新组织为batch格式
-                    batch_size = int(graph_data.batch.max().item() + 1)
-                    if batch_size == 1:
-                        residue_features_batch = residue_features.unsqueeze(0)
-                        pos_CA_batch = pos_CA.unsqueeze(0)
-                        pos_CB_batch = pos_CB.unsqueeze(0)
-                        mask = torch.ones(1, residue_features.shape[0], dtype=torch.bool, device=updated_x.device)
-                        
-                        # 应用位置感知注意力
-                        enhanced_residue = self.geometric_processor.apply_positional_attention(
-                            residue_features_batch, pos_CA_batch, pos_CB_batch, mask
-                        )
-                        
-                        # 将增强特征映射回原子级（简单版本）
-                        for i, res_idx in enumerate(torch.unique(atom2residue)):
-                            if res_idx < enhanced_residue.shape[1]:
-                                enhanced_feat = enhanced_residue[0, i]
-                                atom_mask = atom2residue == res_idx
-                                if atom_mask.any():
-                                    updated_x[atom_mask] = updated_x[atom_mask] + enhanced_feat * 0.1
-            except Exception as e:
-                # 如果几何处理失败，继续使用原子级特征
-                pass
+            )
+            
+            if residue_features.shape[0] > 0:
+                # 重新组织为batch格式
+                batch_size = int(graph_data.batch.max().item() + 1)
+                if batch_size == 1:
+                    residue_features_batch = residue_features.unsqueeze(0)
+                    pos_CA_batch = pos_CA.unsqueeze(0)
+                    pos_CB_batch = pos_CB.unsqueeze(0)
+                    mask = torch.ones(1, residue_features.shape[0], dtype=torch.bool, device=updated_x.device)
+                    
+                    # 应用位置感知注意力
+                    enhanced_residue = self.geometric_processor.apply_positional_attention(
+                        residue_features_batch, pos_CA_batch, pos_CB_batch, mask
+                    )
+                    
+                    # 将增强特征映射回原子级（简单版本）
+                    for i, res_idx in enumerate(torch.unique(atom2residue)):
+                        if res_idx < enhanced_residue.shape[1]:
+                            enhanced_feat = enhanced_residue[0, i]
+                            atom_mask = atom2residue == res_idx
+                            if atom_mask.any():
+                                updated_x[atom_mask] = updated_x[atom_mask] + enhanced_feat * 0.1
         
         # 全局池化
         if graph_data.batch.dtype != torch.int64:

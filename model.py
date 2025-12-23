@@ -5,12 +5,12 @@ import pandas as pd
 import time
 from pathlib import Path
 from typing import Dict, Optional, Any, Union
-from dataclasses import dataclass
+from torch_cluster import radius
 from feature_extractor import RealFeatureExtractor
 # 导入几何特征模块
 from geometry import (
-    InterfaceGraphData, SimplifiedGeometricGNN, UnifiedGeometricProcessor, UnifiedResidueGeometry,
-    nearest, build_unified_residue_frames
+    InterfaceGraphData, SimplifiedGeometricGNN, UnifiedGeometricProcessor, 
+    UnifiedResidueGeometry, build_unified_residue_frames
 )
 # 导入Bio.PDB相关模块
 from Bio.PDB import PDBParser
@@ -503,102 +503,178 @@ class DDGModelTester:
         
 
     def _build_edges_from_positions_ddgtester(self, node_positions, residue_indices):
-        """基于原子位置构建边 - 压缩到64维边特征"""
-        edge_sources = []
-        edge_targets = []
-        edge_features_list = []
-        edge_types_list = []
-        
+        """基于原子位置构建边 - 使用GearBind方法，完全避免O(n²)计算"""        
         n_nodes = len(node_positions)
+        if n_nodes == 0:
+            return (torch.zeros(2, 0, dtype=torch.long), 
+                   torch.zeros(0, 96, dtype=torch.float32),
+                   torch.zeros(0, dtype=torch.long))
         
-        # 计算距离矩阵
-        dist_matrix = np.zeros((n_nodes, n_nodes))
-        for i in range(n_nodes):
-            for j in range(n_nodes):
-                dist_matrix[i, j] = np.linalg.norm(node_positions[i] - node_positions[j])
+        # 转换为torch tensor
+        node_positions_tensor = torch.tensor(node_positions, dtype=torch.float32)
+        batch = torch.zeros(n_nodes, dtype=torch.long)  # 所有节点属于一个图
+        cutoff_distance = 5.0
         
-        # 构建多种类型的边
-        for i in range(n_nodes):
-            for j in range(i + 1, n_nodes):
-                dist = dist_matrix[i, j]
-                
-                # 确定边类型（根据GearBind论文）
-                res_i = residue_indices[i].split('_')[0]
-                res_j = residue_indices[j].split('_')[0]
-                
-                # 同一残基内的原子
-                if res_i == res_j:
-                    if dist < 2.0:  # 共价键距离
-                        edge_type = 0  # 共价键
-                    elif dist < 5.0:
-                        edge_type = 2  # 空间径向关系
-                    else:
-                        continue
-                elif dist < 5.0:
-                    edge_type = 2  # 空间径向关系（radial edges）
-                elif dist < 8.0:
-                    edge_type = 1  # K近邻关系（KNN edges）
-                else:
-                    continue
-                
-                edge_sources.extend([i, j])
-                edge_targets.extend([j, i])
-                
-                # 构建96维边特征 (从64提升到96)
-                edge_feat = np.zeros(96)  # 提升到96维
-                
-                # 1. 基础距离特征 (0-2)
-                edge_feat[0] = dist
-                edge_feat[1] = 1.0 / dist if dist > 0 else 0
-                edge_feat[2] = np.log(dist + 1.0)
-                
-                # 2. 方向特征 (3-5)
-                if dist > 0:
-                    direction = (node_positions[j] - node_positions[i]) / dist
-                    edge_feat[3:6] = direction
-                
-                # 3. 序列距离特征 (6-8)
-                seq_dist = abs(i - j)
-                edge_feat[6] = seq_dist
-                edge_feat[7] = 1.0 / (seq_dist + 1.0)
-                edge_feat[8] = np.log(seq_dist + 1.0)
-                
-                # 4. 简化的残基类型交互特征 (9-28)
-                aa_types = 'ACDEFGHIKLMNPQRSTVWY'
-                aa_idx_i = aa_types.find(res_i) if res_i in aa_types else 0
-                aa_idx_j = aa_types.find(res_j) if res_j in aa_types else 0
-                edge_feat[9 + aa_idx_i] = 1.0
-                edge_feat[19 + aa_idx_j] = 1.0  # 简化位置分配
-                
-                # 5. 增强的几何编码特征 (29-95) - 扩展到96维
-                for k in range(8):  # 从6增加到8，提供更丰富的几何编码
-                    freq = (k + 1) * np.pi
-                    idx = 29 + k * 8  # 每个频率使用8维而不是6维
-                    if idx + 7 < 96:
-                        edge_feat[idx] = np.sin(dist * freq)
-                        edge_feat[idx + 1] = np.cos(dist * freq)
-                        edge_feat[idx + 2] = np.sin(dist * freq * 2)
-                        edge_feat[idx + 3] = np.cos(dist * freq * 2)
-                        edge_feat[idx + 4] = np.sin(dist * freq * 3)
-                        edge_feat[idx + 5] = np.cos(dist * freq * 3)
-                        edge_feat[idx + 6] = np.sin(dist * freq * 4)  # 新增更高频编码
-                        edge_feat[idx + 7] = np.cos(dist * freq * 4)  # 新增更高频编码
-                
-                edge_features_list.extend([edge_feat, edge_feat])
-                edge_types_list.extend([edge_type, edge_type])
+            
+        # 使用radius搜索找到所有距离在cutoff内的原子对
+        row, col = radius(node_positions_tensor, node_positions_tensor, 
+                        r=cutoff_distance, batch_x=batch, batch_y=batch)
         
-        edge_index = torch.tensor([edge_sources, edge_targets], dtype=torch.long)
-        edge_features = torch.tensor(edge_features_list, dtype=torch.float32)
-        edge_types = torch.tensor(edge_types_list, dtype=torch.long)
-        # 确保所有索引都是int64
-        edge_index = edge_index.long()
-        edge_types = edge_types.long()
-        # 确保所有索引都是int64
-        edge_index = edge_index.long()
-        edge_types = edge_types.long()
+        # 过滤自连接
+        mask = row != col
+        row = row[mask]
+        col = col[mask]
         
+        # 过滤重复边，只保留row < col的边，然后创建双向边
+        unique_mask = row < col
+        row = row[unique_mask]
+        col = col[unique_mask]
+        
+        # 批量计算距离
+        distances = torch.norm(node_positions_tensor[row] - node_positions_tensor[col], dim=1)
+        
+        # 构建边特征和类型（向量化）
+        edge_features = self._create_edge_features_gearbind(row, col, distances, node_positions, residue_indices)
+        edge_types = self._create_edge_types_gearbind(row, col, distances, residue_indices)
+        
+        # 创建双向边
+        edge_index = torch.stack([
+            torch.cat([row, col]),
+            torch.cat([col, row])
+        ], dim=0)
+        edge_features = torch.cat([edge_features, edge_features], dim=0)
+        edge_types = torch.cat([edge_types, edge_types], dim=0)
         return edge_index, edge_features, edge_types
     
+    def _create_edge_features_gearbind(self, row, col, distances, node_positions, residue_indices):
+        """GearBind风格的向量化边特征创建"""
+        num_edges = len(row)
+        edge_features = torch.zeros(num_edges, 96, dtype=torch.float32)
+        
+        # 1. 基础距离特征 (0-2) - 向量化
+        edge_features[:, 0] = distances
+        edge_features[:, 1] = 1.0 / (distances + 1e-6)
+        edge_features[:, 2] = torch.log(distances + 1.0)
+        
+        # 2. 方向特征 (3-5) - 批量计算
+        node_positions_tensor = torch.tensor(node_positions, dtype=torch.float32)
+        directions = (node_positions_tensor[col] - node_positions_tensor[row]) / distances.unsqueeze(1)
+        edge_features[:, 3:6] = directions
+        
+        # 3. 序列距离特征 (6-8) - 向量化
+        seq_dists = (row - col).abs().float()
+        edge_features[:, 6] = seq_dists
+        edge_features[:, 7] = 1.0 / (seq_dists + 1.0)
+        edge_features[:, 8] = torch.log(seq_dists + 1.0)
+        
+        # 4. 残基类型特征 (9-28) - 批量处理
+        aa_types = 'ACDEFGHIKLMNPQRSTVWY'
+        for i, (r, c) in enumerate(zip(row.tolist(), col.tolist())):
+            res_i = residue_indices[r].split('_')[0]
+            res_j = residue_indices[c].split('_')[0]
+            aa_idx_i = min(aa_types.find(res_i) if res_i in aa_types else 0, 9)
+            aa_idx_j = min(aa_types.find(res_j) if res_j in aa_types else 0, 9)
+            edge_features[i, 9 + aa_idx_i] = 1.0
+            edge_features[i, 19 + aa_idx_j] = 1.0
+        
+        # 5. 简化的几何编码 (29-95) - 减少频率数量，向量化
+        for k in range(4):  # 从8减少到4个频率，减少计算量
+            freq = (k + 1) * np.pi
+            start_idx = 29 + k * 16
+            if start_idx + 15 < 96:
+                sin_vals = torch.sin(distances * freq)
+                cos_vals = torch.cos(distances * freq)
+                edge_features[:, start_idx] = sin_vals
+                edge_features[:, start_idx + 1] = cos_vals
+                edge_features[:, start_idx + 8] = sin_vals * 2
+                edge_features[:, start_idx + 9] = cos_vals * 2
+        
+        return edge_features
+    
+    def _create_edge_types_gearbind(self, row, col, distances, residue_indices):
+        """GearBind风格的向量化边类型创建"""
+        edge_types = torch.zeros(len(row), dtype=torch.long)
+        
+        for i, (r, c) in enumerate(zip(row.tolist(), col.tolist())):
+            res_i = residue_indices[r].split('_')[0]
+            res_j = residue_indices[c].split('_')[0]
+            dist = distances[i].item()
+            
+            if res_i == res_j:
+                edge_types[i] = 0 if dist < 2.0 else 2
+            else:
+                edge_types[i] = 2
+        
+        return edge_types
+    
+    def _create_edge_feature_simple(self, dist, i, j, res_i, res_j):
+        """极简边特征 - 用于回退方法"""
+        edge_feat = np.zeros(96, dtype=np.float32)
+        
+        # 只保留最基础的特征
+        edge_feat[0] = dist
+        edge_feat[1] = 1.0 / (dist + 1e-6)
+        edge_feat[2] = np.log(dist + 1.0)
+        
+        # 序列距离
+        seq_dist = abs(i - j)
+        edge_feat[6] = seq_dist
+        edge_feat[7] = 1.0 / (seq_dist + 1.0)
+        
+        # 简化的残基特征
+        aa_types = 'ACDEFGHIKLMNPQRSTVWY'
+        aa_idx_i = min(aa_types.find(res_i) if res_i in aa_types else 0, 9)
+        aa_idx_j = min(aa_types.find(res_j) if res_j in aa_types else 0, 9)
+        edge_feat[9 + aa_idx_i] = 1.0
+        edge_feat[19 + aa_idx_j] = 1.0
+        
+        return edge_feat
+    
+    def _create_edge_feature(self, dist, i, j, node_positions, res_i, res_j, idx):
+        """创建边特征 - 简化版本"""
+        edge_feat = np.zeros(96, dtype=np.float32)
+        
+        # 1. 基础距离特征 (0-2)
+        edge_feat[0] = dist
+        edge_feat[1] = 1.0 / dist if dist > 0 else 0
+        edge_feat[2] = np.log(dist + 1.0)
+        
+        # 2. 方向特征 (3-5)
+        if dist > 0 and i < len(node_positions) and j < len(node_positions):
+            direction = (node_positions[j] - node_positions[i]) / dist
+            edge_feat[3:6] = direction[:3]
+        
+        # 3. 序列距离特征 (6-8)
+        seq_dist = abs(i - j)
+        edge_feat[6] = seq_dist
+        edge_feat[7] = 1.0 / (seq_dist + 1.0)
+        edge_feat[8] = np.log(seq_dist + 1.0)
+        
+        # 4. 简化的残基类型交互特征 (9-28)
+        aa_types = 'ACDEFGHIKLMNPQRSTVWY'
+        aa_idx_i = aa_types.find(res_i) if res_i in aa_types else 0
+        aa_idx_j = aa_types.find(res_j) if res_j in aa_types else 0
+        if 9 + aa_idx_i < 96:
+            edge_feat[9 + aa_idx_i] = 1.0
+        if 19 + aa_idx_j < 96:
+            edge_feat[19 + aa_idx_j] = 1.0
+        
+        # 5. 简化的几何编码特征 (29-95)
+        for k in range(8):  # 减少编码复杂度
+            freq = (k + 1) * np.pi
+            start_idx = 29 + k * 8
+            if start_idx + 7 < 96:
+                edge_feat[start_idx] = np.sin(dist * freq)
+                edge_feat[start_idx + 1] = np.cos(dist * freq)
+                edge_feat[start_idx + 2] = np.sin(dist * freq * 2)
+                edge_feat[start_idx + 3] = np.cos(dist * freq * 2)
+                edge_feat[start_idx + 4] = np.sin(dist * freq * 3)
+                edge_feat[start_idx + 5] = np.cos(dist * freq * 3)
+                edge_feat[start_idx + 6] = np.sin(dist * freq * 4)
+                edge_feat[start_idx + 7] = np.cos(dist * freq * 4)
+        
+        return edge_feat
+
 
     def test_from_csv(self, csv_path, pdb_col="#Pdb_origin", mutation_col="Mutation(s)_cleaned", limit=None):
         """
@@ -704,7 +780,8 @@ class DDGModelTester:
                         node_positions=torch.zeros(1, 3, device=self.device),
                         batch=torch.zeros(1, dtype=torch.long, device=self.device),
                         atom_names=[""],
-                        is_mutation=torch.zeros(1, dtype=torch.bool, device=self.device)
+                        is_mutation=torch.zeros(1, dtype=torch.bool, device=self.device),
+                        residue_indices=[""]  # 添加缺失的残基索引
                     )
                     ddg_pred = self.model(
                         esm_embeddings, 

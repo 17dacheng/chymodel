@@ -242,9 +242,9 @@ class RealFeatureExtractor:
                 print(f"  警告: 未找到PDB文件 {pdb_id}_{mutation_str}，使用默认序列特征")
                 seq_feature = self._get_default_sequence_features()
             seq_time = time.time() - start_time
-            print(f"  ESM序列特征提取时间: {seq_time:.3f}秒")
-        else:
-            print(f"  ESM序列特征从缓存加载")
+            # print(f"  ESM序列特征提取时间: {seq_time:.3f}秒")
+        # else:
+            # print(f"  ESM序列特征从缓存加载")
         
         # 提取能量项特征（如果不在缓存中）
         if energy_feature is None:
@@ -252,9 +252,9 @@ class RealFeatureExtractor:
             energy_feature = self.energy_extractor.extract_energy_features(pdb_id, mutation_str)
             self.cache.save_energy_feature(pdb_id, mutation, energy_feature)
             foldx_time = time.time() - start_time
-            print(f"  FoldX能量项提取时间: {foldx_time:.3f}秒")
-        else:
-            print(f"  FoldX能量项从缓存加载")
+        #     print(f"  FoldX能量项提取时间: {foldx_time:.3f}秒")
+        # else:
+        #     print(f"  FoldX能量项从缓存加载")
         
         return seq_feature, energy_feature
     
