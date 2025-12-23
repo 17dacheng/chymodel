@@ -224,7 +224,7 @@ class RealFeatureExtractor:
         Returns:
             tuple: (sequence_embedding, energy_features)
         """
-        print(f"\n提取特征: {pdb_id}_{chain}_{mutation}")
+        # print(f"\n提取特征: {pdb_id}_{chain}_{mutation}")
         
         # 检查缓存
         seq_feature = self.cache.get_sequence_feature(pdb_id, chain)
@@ -242,9 +242,6 @@ class RealFeatureExtractor:
                 print(f"  警告: 未找到PDB文件 {pdb_id}_{mutation_str}，使用默认序列特征")
                 seq_feature = self._get_default_sequence_features()
             seq_time = time.time() - start_time
-            # print(f"  ESM序列特征提取时间: {seq_time:.3f}秒")
-        # else:
-            # print(f"  ESM序列特征从缓存加载")
         
         # 提取能量项特征（如果不在缓存中）
         if energy_feature is None:

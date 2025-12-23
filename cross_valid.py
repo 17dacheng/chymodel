@@ -95,7 +95,7 @@ class Trainer:
             # 处理批量预测值和真实值
             pred_mean = ddg_pred.mean().item()
             true_mean = ddg_true.mean().item()
-            print(f"  Batch {batch_idx+1}/{len(train_loader)} | Loss: {batch_loss:.6f} | Predicted: {pred_mean:.4f} | True: {true_mean:.4f}")
+            print(f"Batch {batch_idx+1}/{len(train_loader)} | Loss: {batch_loss:.6f} | Predicted: {pred_mean:.4f} | True: {true_mean:.4f}")
             
             # 记录指标
             all_predictions.extend(ddg_pred.detach().cpu().numpy())
@@ -158,7 +158,7 @@ class Trainer:
                 # 处理批量预测值和真实值
                 pred_mean = ddg_pred.mean().item()
                 true_mean = ddg_true.mean().item()
-                print(f"  Val Batch {batch_idx+1}/{len(val_loader)} | Loss: {batch_loss:.6f} | Predicted: {pred_mean:.4f} | True: {true_mean:.4f}")
+                print(f"Val Batch {batch_idx+1}/{len(val_loader)} | Loss: {batch_loss:.6f} | Predicted: {pred_mean:.4f} | True: {true_mean:.4f}")
                 
                 # 记录指标
                 all_predictions.extend(ddg_pred.cpu().numpy())

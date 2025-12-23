@@ -227,11 +227,9 @@ class CHYModelWithGeometric(nn.Module):
         
         # 打印各部分处理时间
         total_forward_time = time.time() - forward_start_time
-        print(f"前向传播时间统计:")
-        print(f"  - FoldX特征处理: {foldx_time:.3f}秒")
-        print(f"  - ESM特征处理: {esm_time:.3f}秒")
-        print(f"  - 几何特征处理: {geom_time:.3f}秒")
-        print(f"  - 总前向传播时间: {total_forward_time:.3f}秒")
+        # print(f"前向传播时间统计:")
+        # print(f"  - 几何特征处理: {geom_time:.3f}秒")
+        # print(f"  - 总前向传播时间: {total_forward_time:.3f}秒")
         
         return ddg_pred
 
@@ -299,7 +297,7 @@ class DDGModelTester:
     
     def extract_geometric_features(self, pdb_id: str, chain: str, mutation: str):
         """从实际PDB文件中提取野生型和突变体结构的界面特征"""
-        start_time = time.time()
+        # start_time = time.time()
         # 构建文件路径
         mutation_str = mutation[0] + chain + mutation[1:]
         pdb_base_path = Path("/home/chengwang/data/SKEMPI/PDBs_fixed")
@@ -345,18 +343,11 @@ class DDGModelTester:
             print(f"  警告: 无法提取残基")
             return None, None
         
-        # print(f"  野生型残基数: {len(wt_all_residues)}")
-        # print(f"  突变体残基数: {len(mt_all_residues)}")
-        
         # 构建图数据
         wt_graph = self._build_interface_graph_from_structure(wt_structure, wt_all_residues, is_mutant=False, mutation=mutation)
         mt_graph = self._build_interface_graph_from_structure(mt_structure, mt_all_residues, is_mutant=True, mutation=mutation)
-        
-        # print(f"  野生型图: 节点={wt_graph.node_features.shape[0]}, 边={wt_graph.edge_index.shape[1]}")
-        # print(f"  突变体图: 节点={mt_graph.node_features.shape[0]}, 边={mt_graph.edge_index.shape[1]}")
-        
-        geometric_time = time.time() - start_time
-        print(f"  几何特征提取时间: {geometric_time:.3f}秒")
+        # geometric_time = time.time() - start_time
+        # print(f"  几何特征提取时间: {geometric_time:.3f}秒")
         
         return wt_graph, mt_graph
         
