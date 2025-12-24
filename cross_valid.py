@@ -30,11 +30,22 @@ class Trainer:
         model: nn.Module,
         device: torch.device,
         learning_rate: float = 1e-3,
-        patience: int = 20
+        patience: int = 20,
+        loss_type: str = "mse"
     ):
         self.model = model.to(device)
         self.device = device
+        self.loss_type = loss_type
+        
+        # 主要损失函数 - MSE
         self.criterion = nn.MSELoss()
+        
+        # 辅助损失函数 - MAE（用于鲁棒性）
+        self.mae_criterion = nn.L1Loss()
+        
+        # Huber损失（结合MSE和MAE的优点）
+        self.huber_criterion = nn.HuberLoss(delta=1.0)
+        
         self.optimizer = optim.Adam(
             model.parameters(), 
             lr=learning_rate
@@ -81,7 +92,41 @@ class Trainer:
                 # 不使用几何特征（向后兼容）
                 ddg_pred = self.model(esm_emb, foldx_feat, attention_mask)
             
-            loss = self.criterion(ddg_pred, ddg_true)
+            # 使用组合损失
+            if self.loss_type == "mse":
+                # 标准MSE损失
+                # 使用与训练相同的损失计算方法
+                if self.loss_type == "mse":
+                    loss = self.criterion(ddg_pred, ddg_true)
+                elif self.loss_type == "huber":
+                    loss = self.huber_criterion(ddg_pred, ddg_true)
+                elif self.loss_type == "combined":
+                    mse_loss = self.criterion(ddg_pred, ddg_true)
+                    mae_loss = self.mae_criterion(ddg_pred, ddg_true)
+                    loss = mse_loss + 0.1 * mae_loss
+                else:
+                    loss = self.criterion(ddg_pred, ddg_true)
+            elif self.loss_type == "huber":
+                # Huber损失 - 对异常值更鲁棒
+                loss = self.huber_criterion(ddg_pred, ddg_true)
+            elif self.loss_type == "combined":
+                # 组合损失：MSE + MAE
+                mse_loss = self.criterion(ddg_pred, ddg_true)
+                mae_loss = self.mae_criterion(ddg_pred, ddg_true)
+                loss = mse_loss + 0.1 * mae_loss  # MAE权重较小
+            else:
+                # 默认使用MSE
+                # 使用与训练相同的损失计算方法
+                if self.loss_type == "mse":
+                    loss = self.criterion(ddg_pred, ddg_true)
+                elif self.loss_type == "huber":
+                    loss = self.huber_criterion(ddg_pred, ddg_true)
+                elif self.loss_type == "combined":
+                    mse_loss = self.criterion(ddg_pred, ddg_true)
+                    mae_loss = self.mae_criterion(ddg_pred, ddg_true)
+                    loss = mse_loss + 0.1 * mae_loss
+                else:
+                    loss = self.criterion(ddg_pred, ddg_true)
             
             # 反向传播
             loss.backward()
@@ -149,7 +194,17 @@ class Trainer:
                     # 不使用几何特征（向后兼容）
                     ddg_pred = self.model(esm_emb, foldx_feat, attention_mask)
                 
-                loss = self.criterion(ddg_pred, ddg_true)
+                # 使用与训练相同的损失计算方法
+                if self.loss_type == "mse":
+                    loss = self.criterion(ddg_pred, ddg_true)
+                elif self.loss_type == "huber":
+                    loss = self.huber_criterion(ddg_pred, ddg_true)
+                elif self.loss_type == "combined":
+                    mse_loss = self.criterion(ddg_pred, ddg_true)
+                    mae_loss = self.mae_criterion(ddg_pred, ddg_true)
+                    loss = mse_loss + 0.1 * mae_loss
+                else:
+                    loss = self.criterion(ddg_pred, ddg_true)
                 
                 # 打印验证batch的损失
                 batch_loss = loss.item()
@@ -252,7 +307,8 @@ def train_fold(
             model=model,
             device=device,
             learning_rate=config.get('learning_rate', 1e-3),
-            patience=config.get('patience', 20)
+            patience=config.get('patience', 20),
+            loss_type=config.get('loss_type', 'mse')
         )
         
         # 训练循环
@@ -376,6 +432,7 @@ def five_fold_cross_validation(
         'num_attention_heads': 8,
         'print_every': 10,
         'use_geometric_features': True,  # 使用几何特征
+        'loss_type': 'mse',  # 损失函数类型: 'mse', 'huber', 'combined'
         'random_seed': 42
     }
     
@@ -527,6 +584,8 @@ def main():
                        help='设备 (cuda/cpu)')
     parser.add_argument('--no_geometric_features', action='store_true',
                        help='不使用几何特征')
+    parser.add_argument('--loss_type', type=str, default='mse', choices=['mse', 'huber', 'combined'],
+                       help='损失函数类型 (mse/huber/combined)')
     
     args = parser.parse_args()
     
@@ -539,7 +598,8 @@ def main():
         'learning_rate': args.learning_rate,
         'device': args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu',
         'pdb_base_path': args.pdb_base_path,
-        'use_geometric_features': not args.no_geometric_features
+        'use_geometric_features': not args.no_geometric_features,
+        'loss_type': args.loss_type
     }
     
     # 运行五折交叉验证

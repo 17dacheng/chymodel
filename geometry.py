@@ -93,7 +93,7 @@ class UnifiedResidueGeometry(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         
-        # GearBind标准的37维原子类型映射
+        # 37维原子类型映射
         self.atom_name2id = {
             'N': 0, 'CA': 1, 'C': 2, 'CB': 3, 'O': 4, 'CG': 5, 'CG1': 6, 'CG2': 7, 
             'OG': 8, 'OG1': 9, 'SG': 10, 'CD': 11, 'CD1': 12, 'CD2': 13, 'ND1': 14, 
@@ -165,7 +165,7 @@ class UnifiedResidueGeometry(nn.Module):
         return residue_frames, residue_atom_positions
     
     def atom_to_feature(self, atom, residue_feature=None):
-        """原子转换为特征向量 - GearBind模式"""
+        """原子转换为特征向量"""
         # 37维原子类型one-hot编码
         atom_name = atom.name.strip()
         atom_type_idx = self.atom_name2id.get(atom_name, 0)
@@ -413,7 +413,7 @@ class UnifiedGeometricProcessor(nn.Module):
         }
     
     def apply_knn_selection(self, node_positions_tensor, atom_names, is_mutation_tensor, batch):
-        """应用KNN突变位点选择 - 完全优化的GearBind方法"""
+        """应用KNN突变位点选择 - 完全优化方法"""
         device = node_positions_tensor.device
         
         # 找到突变位点的CA原子
@@ -426,10 +426,10 @@ class UnifiedGeometricProcessor(nn.Module):
         center_positions = node_positions_tensor[mutation_ca_mask]
         mut2graph = batch[mutation_ca_mask]
         
-        # GearBind完全优化方法: 一次性处理所有突变位点
+        # 完全优化方法: 一次性处理所有突变位点
         k_select = min(self.knn_k, len(node_positions_tensor))
         if len(center_positions) > 0 and len(node_positions_tensor) > k_select:
-            # 使用GearBind风格 - 直接调用knn处理所有中心点
+            # 直接调用knn处理所有中心点
             knn_indices = knn(node_positions_tensor, center_positions, k_select, batch, mut2graph)
             # knn_indices shape: [num_centers, k]
             

@@ -32,10 +32,13 @@ class CHYModelWithGeometric(nn.Module):
         self.foldx_dim = foldx_dim
         self.geometric_dim = geometric_dim
         
-        # FoldX特征投影 - 与ESM特征保持相同维度
+        # FoldX特征投影 - 降低维度
         self.foldx_projection = nn.Sequential(
-            nn.Linear(foldx_dim, hidden_dim // 4),  # 直接输出128维，与ESM特征相同
+            nn.Linear(foldx_dim, hidden_dim // 4),
             nn.LayerNorm(hidden_dim // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 4, 64),  # 降低到64维特征
+            nn.LayerNorm(64),
             nn.ReLU()
         )
         
@@ -67,50 +70,16 @@ class CHYModelWithGeometric(nn.Module):
             num_heads=4
         )
         
-        # 序列和FoldX特征融合MLP
-        self.seq_foldx_mlp = nn.Sequential(
+        # 反对称性处理方法
+        # 创建MLP用于特征转换
+        self.feature_mlp = nn.Sequential(
             nn.Linear(
-                hidden_dim // 4 + hidden_dim // 4,  # seq_rep + foldx_expanded = 128 + 128 = 256
-                hidden_dim // 2  # 中间层
+                hidden_dim // 4 + 64 + 128 + 128,  # seq_rep + foldx_expanded + wt_geom_rep + mt_geom_rep = 448
+                hidden_dim // 2
             ),
             nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),  # 输出128维，与几何特征同维度
-            nn.LayerNorm(hidden_dim // 4),
-            nn.ReLU()
-        )
-        
-        # 反对称几何特征处理MLP
-        self.geometric_antisymmetric_mlp = nn.Sequential(
-            nn.Linear(
-                128 + 128,  # mt_geom_rep + wt_geom_rep = 256
-                hidden_dim // 2  # 256维 -> 256维，充分提取反对称信息
-            ),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),  # 256维 -> 128维
-            nn.LayerNorm(hidden_dim // 4),
-            nn.ReLU()
-        )
-        
-        # 特征融合注意力权重（强调反对称特征的重要性）
-        self.feature_fusion = nn.Sequential(
-            nn.Linear(
-                hidden_dim // 4 + hidden_dim // 4,  # seq_foldx + antisymmetric = 128 + 128 = 256
-                hidden_dim // 2  # 中间层维度
-            ),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 2),  # 输出2个权重
-            nn.Softmax(dim=-1)
-        )
-        
-        # 最终特征融合层
-        self.final_fusion = nn.Sequential(
-            nn.Linear(
-                hidden_dim // 4,  # 加权融合后的特征维度保持128维
-                hidden_dim // 4
-            ),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
             nn.LayerNorm(hidden_dim // 4),
             nn.ReLU()
         )
@@ -139,16 +108,6 @@ class CHYModelWithGeometric(nn.Module):
             elif isinstance(module, nn.BatchNorm1d):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
-        
-        # 特别初始化特征融合层的偏置，让反对称特征权重更高
-        if hasattr(self, 'feature_fusion'):
-            # feature_fusion的最后一层Linear层输出2个权重
-            # 设置偏置让第二个权重（反对称特征）初始为0.7，第一个为0.3
-            fusion_layers = list(self.feature_fusion.children())
-            for layer in fusion_layers:
-                if isinstance(layer, nn.Linear) and layer.out_features == 2:
-                    with torch.no_grad():
-                        layer.bias.data = torch.tensor([0.3, 0.7])  # [seq_weight, antisymmetric_weight]
     
     def forward(self, 
                 esm_embeddings: torch.Tensor,
@@ -220,50 +179,41 @@ class CHYModelWithGeometric(nn.Module):
         # 确保几何特征维度正确（当前已经是128维）
         # 几何特征已经通过SimplifiedGeometricGNN输出为128维
         
-        # FoldX特征现在已经是128维，直接使用
-        foldx_expanded = foldx_proj  # [batch_size, hidden_dim//4=128]
+        # 确保FoldX特征维度正确
+        if foldx_proj.shape[-1] != 64:
+            foldx_expansion = nn.Linear(foldx_proj.shape[-1], 64).to(seq_rep.device)
+            foldx_expanded = foldx_expansion(foldx_proj)
+        else:
+            foldx_expanded = foldx_proj
         
-        # 1. 序列和FoldX特征单独处理
-        seq_foldx_combined = torch.cat([
+        # 拼接所有特征，创建[mutant, wild_type]和[wild_type, mutant]两种组合
+        # 通过特征顺序的交换实现反对称性
+        
+        # 组合1: [mutant_features, wild_type_features]
+        combined_mt_wt = torch.cat([
             seq_rep,  # 序列特征 [batch_size, hidden_dim//4=128]
-            foldx_expanded,  # FoldX特征 [batch_size, hidden_dim//4=128]
-        ], dim=-1)  # [batch_size, 256]
-        seq_foldx_features = self.seq_foldx_mlp(seq_foldx_combined)  # [batch_size, hidden_dim//4=128]
+            foldx_expanded,  # FoldX特征 [batch_size, 64]
+            mt_geom_rep,  # MT几何特征 [batch_size, 128]
+            wt_geom_rep   # WT几何特征 [batch_size, 128]
+        ], dim=-1)  # [batch_size, 128 + 64 + 128 + 128 = 448]
         
-        # 2. 几何特征反对称性处理
-        # 创建两种组合用于反对称计算
-        geom_mt_wt = torch.cat([mt_geom_rep, wt_geom_rep], dim=-1)  # [batch_size, 256]
-        geom_wt_mt = torch.cat([wt_geom_rep, mt_geom_rep], dim=-1)  # [batch_size, 256]
+        # 组合2: [wild_type_features, mutant_features] 
+        combined_wt_mt = torch.cat([
+            seq_rep,  # 序列特征 [batch_size, hidden_dim//4=128]
+            foldx_expanded,  # FoldX特征 [batch_size, 64]
+            wt_geom_rep,  # WT几何特征 [batch_size, 128]
+            mt_geom_rep   # MT几何特征 [batch_size, 128]
+        ], dim=-1)  # [batch_size, 128 + 64 + 128 + 128 = 448]
         
-        # 通过MLP处理两种几何组合
-        mlp_geom_mt_wt = self.geometric_antisymmetric_mlp(geom_mt_wt)  # [batch_size, hidden_dim//4=128]
-        mlp_geom_wt_mt = self.geometric_antisymmetric_mlp(geom_wt_mt)  # [batch_size, hidden_dim//4=128]
+        # 通过MLP处理两种组合
+        mlp_mt_wt = self.feature_mlp(combined_mt_wt)  # [batch_size, hidden_dim//4]
+        mlp_wt_mt = self.feature_mlp(combined_wt_mt)  # [batch_size, hidden_dim//4]
         
-        # 反对称性计算: geom_antisymmetric = mlp([MT, WT]) - mlp([WT, MT])
-        geometric_antisymmetric = mlp_geom_mt_wt - mlp_geom_wt_mt  # [batch_size, hidden_dim//4=128]
+        # 反对称性计算: pred = mlp([MT, WT]) - mlp([WT, MT])
+        antisymmetric_features = mlp_mt_wt - mlp_wt_mt  # [batch_size, hidden_dim//4]
         
-        # 3. 特征融合（强调反对称几何特征的重要性）
-        # 拼接序列/FoldX特征和反对称几何特征
-        fusion_input = torch.cat([
-            seq_foldx_features,  # [batch_size, 128]
-            geometric_antisymmetric  # [batch_size, 128]
-        ], dim=-1)  # [batch_size, 256]
-        
-        # 计算注意力权重（偏向反对称特征）
-        fusion_weights = self.feature_fusion(fusion_input)  # [batch_size, 2]
-        
-        # 应用权重进行加权融合，给反对称特征更高的重要性
-        # 现在两个特征都是128维，可以直接加权融合
-        weighted_features = (
-            fusion_weights[:, 0:1] * seq_foldx_features +  # 序列/FoldX权重
-            fusion_weights[:, 1:2] * geometric_antisymmetric  # 几何反对称权重
-        )  # [batch_size, 128]
-        
-        # 4. 最终特征融合
-        final_features = self.final_fusion(weighted_features)  # [batch_size, hidden_dim//4=128]
-        
-        # 5. 回归预测
-        ddg_pred = self.regression_head(final_features)  # [batch_size, 1]
+        # 回归预测
+        ddg_pred = self.regression_head(antisymmetric_features)  # [batch_size, 1]
         
         # 打印各部分处理时间
         total_forward_time = time.time() - forward_start_time

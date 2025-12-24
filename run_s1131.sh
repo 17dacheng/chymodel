@@ -15,9 +15,10 @@ OUTPUT_DIR="/home/chengwang/code/chymodel/s1131_results"
 BATCH_SIZE=16
 TRAIN_BATCH_SIZE=16
 EVAL_BATCH_SIZE=16
-NUM_EPOCHS=100
+NUM_EPOCHS=20
 LEARNING_RATE=1e-3
 DEVICE="cuda"
+LOSS_TYPE="mse"
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -47,6 +48,10 @@ while [[ $# -gt 0 ]]; do
             DEVICE="$2"
             shift 2
             ;;
+        --loss_type)
+            LOSS_TYPE="$2"
+            shift 2
+            ;;
         --output_dir)
             OUTPUT_DIR="$2"
             shift 2
@@ -60,6 +65,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --num_epochs NUM_EPOCHS           训练轮数 (默认: 50)"
             echo "  --learning_rate LEARNING_RATE     学习率 (默认: 1e-3)"
             echo "  --device DEVICE                   设备 (cuda/cpu, 默认: cuda)"
+            echo "  --loss_type LOSS_TYPE             损失函数类型 (mse/huber/combined, 默认: mse)"
             echo "  --output_dir OUTPUT_DIR           输出目录 (默认: ./s1131_results)"
             echo "  -h, --help                        显示帮助信息"
             exit 0
@@ -96,10 +102,11 @@ echo "  评估批大小: $EVAL_BATCH_SIZE"
 echo "  训练轮数: $NUM_EPOCHS"
 echo "  学习率: $LEARNING_RATE"
 echo "  设备: $DEVICE"
+echo "  损失函数: $LOSS_TYPE"
 echo "========================================"
 
 # 激活conda环境并运行训练
-source /home/chengwang/miniconda3/bin/activate gearbind
+conda activate gearbind
 python cross_valid.py \
     --data_path "$DATA_PATH" \
     --pdb_base_path "$PDB_BASE_PATH" \
@@ -109,7 +116,8 @@ python cross_valid.py \
     --eval_batch_size "$EVAL_BATCH_SIZE" \
     --num_epochs "$NUM_EPOCHS" \
     --learning_rate "$LEARNING_RATE" \
-    --device "$DEVICE" 
+    --device "$DEVICE" \
+    --loss_type "$LOSS_TYPE" 
 
 # 检查训练结果
 if [ $? -eq 0 ]; then
