@@ -11,6 +11,104 @@ from torch_cluster import knn
 from dataclasses import dataclass
 
 
+class DDGAttention(nn.Module):
+    """
+    基于 GearBind 的 DDGAttention 实现
+    用于残基级别的几何特征注意力机制
+    """
+    
+    def __init__(self, input_dim, output_dim, value_dim=16, query_key_dim=16, num_heads=12):
+        super(DDGAttention, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.value_dim = value_dim
+        self.query_key_dim = query_key_dim
+        self.num_heads = num_heads
+
+        self.query = nn.Linear(input_dim, query_key_dim*num_heads, bias=False)
+        self.key   = nn.Linear(input_dim, query_key_dim*num_heads, bias=False)
+        self.value = nn.Linear(input_dim, value_dim*num_heads, bias=False)
+
+        self.out_transform = nn.Linear(
+            in_features = (num_heads*value_dim) + (num_heads*(3+3+1)),
+            out_features = output_dim,
+        )
+        self.layer_norm = nn.LayerNorm(output_dim)
+
+    def _alpha_from_logits(self, logits, mask, inf=1e5):
+        """
+        Args:
+            logits: Logit matrices, (N, L_i, L_j, num_heads).
+            mask:   Masks, (N, L).
+        Returns:
+            alpha:  Attention weights.
+        """
+        N, L, _, _ = logits.size()
+        mask_row = mask.view(N, L, 1, 1).expand_as(logits)      # (N, L, *, *)
+        mask_pair = mask_row * mask_row.permute(0, 2, 1, 3)     # (N, L, L, *)
+        
+        logits = torch.where(mask_pair, logits, logits-inf)
+        alpha = torch.softmax(logits, dim=2)  # (N, L, L, num_heads)
+        alpha = torch.where(mask_row, alpha, torch.zeros_like(alpha))
+        return alpha
+
+    def _heads(self, x, n_heads, n_ch):
+        """
+        Args:
+            x:  (..., num_heads * num_channels)
+        Returns:
+            (..., num_heads, num_channels)
+        """
+        s = list(x.size())[:-1] + [n_heads, n_ch]
+        return x.view(*s)
+
+    def forward(self, x, pos_CA, pos_CB, frame, mask):
+        """
+        DDGAttention前向传播
+        Args:
+            x: (N, L, hidden_dim) 残基特征
+            pos_CA: (N, L, 3) CA原子位置
+            pos_CB: (N, L, 3) CB原子位置  
+            frame: (N, L, 3, 3) 局部坐标系
+            mask: (N, L) 残基掩码
+        """
+        # Attention logits
+        query = self._heads(self.query(x), self.num_heads, self.query_key_dim)    # (N, L, n_heads, head_size)
+        key = self._heads(self.key(x), self.num_heads, self.query_key_dim)      # (N, L, n_heads, head_size)
+        logits_node = torch.einsum('blhd, bkhd->blkh', query, key)
+        alpha = self._alpha_from_logits(logits_node, mask)  # (N, L, L, n_heads)
+
+        value = self._heads(self.value(x), self.num_heads, self.value_dim)  # (N, L, n_heads, head_size)
+        feat_node = torch.einsum('blkh, bkhd->blhd', alpha, value).flatten(-2)
+        
+        # 几何特征计算（基于 GearBind）
+        rel_pos = pos_CB.unsqueeze(1) - pos_CA.unsqueeze(2)  # (N, L, L, 3)
+        atom_pos_bias = torch.einsum('blkh, blkd->blhd', alpha, rel_pos)  # (N, L, n_heads, 3)
+        feat_distance = atom_pos_bias.norm(dim=-1, keepdim=True)
+        feat_points = torch.einsum('blij, blhj->blhi', frame, atom_pos_bias)  # (N, L, n_heads, 3)
+        feat_direction = feat_points / (feat_points.norm(dim=-1, keepdim=True) + 1e-10)
+        
+        feat_spatial = torch.cat([
+            feat_points.flatten(-2),      # (N, L, n_heads * 3)
+            feat_distance.flatten(-2),    # (N, L, n_heads * 1)  
+            feat_direction.flatten(-2),    # (N, L, n_heads * 3)
+        ], dim=-1)
+
+        feat_all = torch.cat([feat_node, feat_spatial], dim=-1)
+
+        feat_all = self.out_transform(feat_all)  # (N, L, F)
+        feat_all = torch.where(mask.unsqueeze(-1), feat_all, torch.zeros_like(feat_all))
+        
+        if x.shape[-1] == feat_all.shape[-1]:
+            # 使用clone()避免梯度计算问题
+            x_clone = x.clone()
+            x_updated = self.layer_norm(x_clone + feat_all)
+        else:
+            x_updated = self.layer_norm(feat_all)
+
+        return x_updated
+
+
 @dataclass
 class InterfaceGraphData:
     """界面图数据容器"""
@@ -84,7 +182,7 @@ def nearest(query, key, query2graph, key2graph):
 class UnifiedResidueGeometry(nn.Module):
     """
     统一的残基几何处理类
-    合并了 AtomPositionGather 和 PositionAwareLayer 的功能
+    基于 GearBind 的几何特征提取方法
     """
     
     def __init__(self, hidden_dim=96, num_heads=4):
@@ -102,21 +200,49 @@ class UnifiedResidueGeometry(nn.Module):
             'CZ3': 29, 'CH2': 30, 'NH1': 31, 'NH2': 32, 'OH': 33, 'SD': 34, 'FE': 35
         }
         
-        # 位置感知注意力机制（原 PositionAwareLayer 的功能）
-        self.query = nn.Linear(hidden_dim, hidden_dim)
-        self.key = nn.Linear(hidden_dim, hidden_dim)
-        self.value = nn.Linear(hidden_dim, hidden_dim)
-        
-        spatial_dim = num_heads * 7  # 3(points) + 1(distance) + 3(direction)
-        self.out_transform = nn.Sequential(
-            nn.Linear(hidden_dim + spatial_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU()
+        # DDGAttention 机制（基于 GearBind）
+        self.attention = DDGAttention(
+            input_dim=hidden_dim,
+            output_dim=hidden_dim,
+            value_dim=16,
+            query_key_dim=16,
+            num_heads=num_heads
         )
-        self.layer_norm = nn.LayerNorm(hidden_dim)
     
+    def from_3_points(self, p_x_axis, origin, p_xy_plane, eps=1e-10):
+        """
+        从三个点构建局部坐标系
+        基于 GearBind 的 from_3_points 实现
+        Args:
+            p_x_axis: [*, 3] coordinates (N atom)
+            origin: [*, 3] coordinates (CA atom) 
+            p_xy_plane: [*, 3] coordinates (C atom)
+            eps: Small epsilon value
+        Returns:
+            旋转矩阵: [* , 3, 3]
+        """
+        e_x = p_x_axis - origin
+        e_x_norm = torch.norm(e_x, dim=-1, keepdim=True)
+        e_x = e_x / (e_x_norm + eps)
+        
+        e_xy = p_xy_plane - origin
+        dot_product = torch.sum(e_x * e_xy, dim=-1, keepdim=True)
+        e_y = e_xy - dot_product * e_x
+        e_y_norm = torch.norm(e_y, dim=-1, keepdim=True)
+        e_y = e_y / (e_y_norm + eps)
+        
+        e_z = torch.cross(e_x, e_y, dim=-1)
+        e_z_norm = torch.norm(e_z, dim=-1, keepdim=True)
+        e_z = e_z / (e_z_norm + eps)
+        
+        # 组合为旋转矩阵: [* , 3, 3]
+        rotation_matrix = torch.cat([e_x, e_y, e_z], dim=-1)
+        rotation_matrix = rotation_matrix.view(*e_x.shape[:-1], 3, 3)
+        
+        return rotation_matrix
+
     def build_residue_frames(self, all_residues):
-        """构建统一的残基坐标系"""
+        """基于 GearBind 方法构建残基坐标系"""
         residue_frames = {}
         residue_atom_positions = {}
         
@@ -124,44 +250,32 @@ class UnifiedResidueGeometry(nn.Module):
             residue_key = f"{residue.parent.id}_{residue.id[1]}"
             atom_positions = {}
             backbone_atoms = {}
-            
+                
             for atom in residue:
                 pos = torch.tensor(atom.coord, dtype=torch.float32)
                 atom_positions[atom.name] = pos
-                
+                    
                 if atom.name in ['N', 'CA', 'C']:
                     backbone_atoms[atom.name] = pos
-            
+                
             residue_atom_positions[residue_key] = atom_positions
-            
+                
             if len(backbone_atoms) == 3:
                 N_pos = backbone_atoms['N']
                 CA_pos = backbone_atoms['CA'] 
                 C_pos = backbone_atoms['C']
-                
-                # 构建标准右手坐标系
-                e_x = N_pos - CA_pos
-                e_x_norm = torch.norm(e_x)
-                if e_x_norm > 1e-6:
-                    e_x = e_x / e_x_norm
-                
-                e_xy = C_pos - CA_pos
-                dot_product = torch.dot(e_x, e_xy)
-                e_y = e_xy - dot_product * e_x
-                e_y_norm = torch.norm(e_y)
-                if e_y_norm > 1e-6:
-                    e_y = e_y / e_y_norm
-                
-                e_z = torch.cross(e_x, e_y)
-                e_z_norm = torch.norm(e_z)
-                if e_z_norm > 1e-6:
-                    e_z = e_z / e_z_norm
-                
-                rotation_matrix = torch.stack([e_x, e_y, e_z], dim=1)
-                residue_frames[residue_key] = rotation_matrix
+                    
+                # 使用 from_3_points 方法构建局部坐标系
+                frame = self.from_3_points(
+                    N_pos.unsqueeze(0),  # [1, 3]
+                    CA_pos.unsqueeze(0), # [1, 3] 
+                    C_pos.unsqueeze(0)   # [1, 3]
+                ).transpose(-1, -2)     # [1, 3, 3] -> [1, 3, 3]
+                    
+                residue_frames[residue_key] = frame.squeeze(0)  # [3, 3]
             else:
                 residue_frames[residue_key] = torch.eye(3)
-        
+            
         return residue_frames, residue_atom_positions
     
     def atom_to_feature(self, atom, residue_feature=None):
@@ -224,126 +338,88 @@ class UnifiedResidueGeometry(nn.Module):
         return atom_feature
     
     def aggregate_atoms_to_residues(self, graph_data):
-        """原子级特征聚合为残基级特征"""
+        """
+        基于 GearBind 方法聚合原子特征到残基级别
+        """
         device = graph_data.node_features.device
-        
+            
         # 构建原子到残基的映射
         atom2residue = torch.zeros(len(graph_data.atom_names), dtype=torch.long, device=device)
         residue_info = {}
         current_residue_idx = 0
-        
+            
         for i, residue_idx in enumerate(graph_data.residue_indices):
             if residue_idx not in residue_info:
                 residue_info[residue_idx] = current_residue_idx
                 current_residue_idx += 1
             atom2residue[i] = residue_info[residue_idx]
-        
+            
         num_residues = len(residue_info)
         
-        # 聚合特征（使用CA原子作为代表）
+        # 初始化原子位置数组 (基于 GearBind 的 atom_pos)
+        atom_pos = torch.full((num_residues, len(self.atom_name2id), 3), float("inf"), 
+                            dtype=torch.float, device=device)
+        atom_pos_mask = torch.zeros((num_residues, len(self.atom_name2id)), 
+                                    dtype=torch.bool, device=device)
+        
+        # 填充原子位置信息
+        for i, (atom_name, residue_idx) in enumerate(zip(graph_data.atom_names, graph_data.residue_indices)):
+            if atom_name in self.atom_name2id:
+                res_idx = residue_info[residue_idx]
+                atom_idx = self.atom_name2id[atom_name]
+                atom_pos[res_idx, atom_idx] = graph_data.node_positions[i]
+                atom_pos_mask[res_idx, atom_idx] = True
+        
+        # 获取 CA 位置
+        pos_CA = atom_pos[:, self.atom_name2id["CA"]]  # [num_residues, 3]
+        
+        # 计算 CB 位置（基于 GearBind 方法）
+        pos_CB = torch.where(
+            atom_pos_mask[:, self.atom_name2id["CB"], None].expand(-1, 3),
+            atom_pos[:, self.atom_name2id["CB"]],
+            pos_CA  # 对于甘氨酸等缺少CB原子的残基，使用CA位置
+        )
+        
+        # 构建局部坐标系 (基于 GearBind 的 frame 构建方法)
+        frames = torch.eye(3).unsqueeze(0).repeat(num_residues, 1, 1).to(device)
+        for res_idx in range(num_residues):
+            if (atom_pos_mask[res_idx, self.atom_name2id["N"]] and 
+                atom_pos_mask[res_idx, self.atom_name2id["CA"]] and 
+                atom_pos_mask[res_idx, self.atom_name2id["C"]]):
+                
+                frame = self.from_3_points(
+                    atom_pos[res_idx, self.atom_name2id["N"]].unsqueeze(0),  # [1, 3]
+                    atom_pos[res_idx, self.atom_name2id["CA"]].unsqueeze(0), # [1, 3] 
+                    atom_pos[res_idx, self.atom_name2id["C"]].unsqueeze(0)   # [1, 3]
+                ).transpose(-1, -2)  # [1, 3, 3]
+                
+                frames[res_idx] = frame.squeeze(0)
+        
+        # 聚合原子特征到残基特征（使用CA原子）
         ca_mask = torch.tensor([name == "CA" for name in graph_data.atom_names], device=device)
         ca_indices = torch.where(ca_mask)[0]
         
         residue_features = torch.zeros(num_residues, self.hidden_dim, device=device)
-        residue_positions_CA = torch.zeros(num_residues, 3, device=device)
-        residue_positions_CB = torch.zeros(num_residues, 3, device=device)
         
         if len(ca_indices) > 0:
             ca_atom2residue = atom2residue[ca_mask]
             ca_features = graph_data.node_features[ca_mask]
-            
+                
             for i in range(num_residues):
                 mask = ca_atom2residue == i
                 if mask.any():
                     residue_features[i] = ca_features[mask].mean(dim=0)
         
-        # 提取位置
-        for atom_idx in ca_indices:
-            res_idx = atom2residue[atom_idx].item()
-            if res_idx < num_residues:
-                residue_positions_CA[res_idx] = graph_data.node_positions[atom_idx]
-        
-        cb_mask = torch.tensor([name == "CB" for name in graph_data.atom_names], device=device)
-        cb_indices = torch.where(cb_mask)[0]
-        for atom_idx in cb_indices:
-            res_idx = atom2residue[atom_idx].item()
-            if res_idx < num_residues:
-                residue_positions_CB[res_idx] = graph_data.node_positions[atom_idx]
-        
-        # 对于没有CB的残基，使用CA位置
-        no_cb_mask = (residue_positions_CB.abs().sum(dim=1) < 1e-6)
-        residue_positions_CB[no_cb_mask] = residue_positions_CA[no_cb_mask]
-        
-        return residue_features, residue_positions_CA, residue_positions_CB, atom2residue
+        return residue_features, pos_CA, pos_CB, atom2residue, frames
     
-    def apply_positional_attention(self, residue_features, pos_CA, pos_CB, mask):
-        """应用残基级位置感知注意力"""
-        batch_size, num_residues, _ = residue_features.shape
+    def apply_positional_attention(self, residue_features, pos_CA, pos_CB, frames, mask):
+        """
+        基于 GearBind DDGAttention 的位置感知注意力
+        """
+        # 使用 DDGAttention 进行几何特征融合
+        enhanced_features = self.attention(residue_features, pos_CA, pos_CB, frames, mask)
         
-        # 构建残基坐标系
-        frames = self._build_frames(pos_CA, pos_CB)
-        
-        # 注意力计算
-        query = self.query(residue_features).view(batch_size, num_residues, self.num_heads, -1)
-        key = self.key(residue_features).view(batch_size, num_residues, self.num_heads, -1)
-        value = self.value(residue_features).view(batch_size, num_residues, self.num_heads, -1)
-        
-        logits = torch.einsum('blhd,bkhd->blkh', query, key)
-        if mask is not None:
-            mask_2d = mask.unsqueeze(1) & mask.unsqueeze(2)
-            mask_expanded = mask_2d.unsqueeze(-1).expand(-1, -1, -1, self.num_heads)
-            logits = logits.masked_fill(~mask_expanded, float('-inf'))
-        
-        alpha = torch.softmax(logits, dim=2)
-        feat_node = torch.einsum('blkh,bkhd->blhd', alpha, value).flatten(-2)
-        
-        # 位置相关特征
-        rel_pos = pos_CB.unsqueeze(2) - pos_CA.unsqueeze(1)
-        atom_pos_bias = torch.einsum('blkh,blkd->blhd', alpha, rel_pos)
-        feat_distance = atom_pos_bias.norm(dim=-1, keepdim=True)
-        feat_points = torch.einsum('blij,blhj->blhi', frames, atom_pos_bias)
-        feat_direction = feat_points / (feat_points.norm(dim=-1, keepdim=True) + 1e-10)
-        
-        # 组合空间特征
-        feat_spatial = torch.cat([
-            feat_points.flatten(-2),
-            feat_distance.flatten(-2),
-            feat_direction.flatten(-2),
-        ], dim=-1)
-        
-        feat_all = torch.cat([feat_node, feat_spatial], dim=-1)
-        feat_all = self.out_transform(feat_all)
-        feat_all = torch.where(mask.unsqueeze(-1), feat_all, torch.zeros_like(feat_all))
-        
-        return self.layer_norm(residue_features + feat_all)
-    
-    def _build_frames(self, pos_CA, pos_CB):
-        """构建残基坐标系"""
-        batch_size, num_residues, _ = pos_CA.shape
-        frames = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(batch_size, num_residues, 1, 1).to(pos_CA.device)
-        
-        for i in range(num_residues):
-            for b in range(batch_size):
-                if i < num_residues - 1:
-                    e1 = pos_CB[b, i] - pos_CA[b, i]
-                    e1_norm = torch.norm(e1)
-                    if e1_norm > 1e-6:
-                        e1 = e1 / e1_norm
-                        
-                        temp_vec = torch.tensor([0.0, 0.0, 1.0], device=pos_CA.device)
-                        e2 = torch.cross(e1, temp_vec)
-                        e2_norm = torch.norm(e2)
-                        if e2_norm < 1e-6:
-                            temp_vec = torch.tensor([0.0, 1.0, 0.0], device=pos_CA.device)
-                            e2 = torch.cross(e1, temp_vec)
-                            e2_norm = torch.norm(e2)
-                        
-                        if e2_norm > 1e-6:
-                            e2 = e2 / e2_norm
-                            e3 = torch.cross(e1, e2)
-                            frames[b, i] = torch.stack([e1, e2, e3], dim=1)
-        
-        return frames
+        return enhanced_features
 
 
 class UnifiedGeometricProcessor(nn.Module):
@@ -352,12 +428,9 @@ class UnifiedGeometricProcessor(nn.Module):
     合并了 KNNMutationSite, InterfaceFeatureExtractor, 和部分几何处理功能
     """
     
-    def __init__(self, hidden_dim=96, cutoff_distance=8.0, k_neighbors=20, knn_mutation_k=256, num_heads=4):
+    def __init__(self, hidden_dim=96, knn_mutation_k=512, num_heads=4):
         super(UnifiedGeometricProcessor, self).__init__()
         
-        self.cutoff_distance = cutoff_distance
-        self.k_neighbors = k_neighbors
-        self.knn_mutation_k = knn_mutation_k
         self.hidden_dim = hidden_dim
         
         # 统一的残基几何处理器
@@ -413,7 +486,7 @@ class UnifiedGeometricProcessor(nn.Module):
         }
     
     def apply_knn_selection(self, node_positions_tensor, atom_names, is_mutation_tensor, batch):
-        """应用KNN突变位点选择 - 完全优化方法"""
+        """应用KNN突变位点选择"""
         device = node_positions_tensor.device
         
         # 找到突变位点的CA原子
@@ -426,7 +499,6 @@ class UnifiedGeometricProcessor(nn.Module):
         center_positions = node_positions_tensor[mutation_ca_mask]
         mut2graph = batch[mutation_ca_mask]
         
-        # 完全优化方法: 一次性处理所有突变位点
         k_select = min(self.knn_k, len(node_positions_tensor))
         if len(center_positions) > 0 and len(node_positions_tensor) > k_select:
             # 直接调用knn处理所有中心点
@@ -519,7 +591,7 @@ class SimplifiedGeometricGNN(nn.Module):
         
         # 残基级几何处理（如果有足够的数据）
         if len(graph_data.residue_indices) > 0:
-            residue_features, pos_CA, pos_CB, atom2residue = self.geometric_processor.aggregate_atoms_to_residues(
+            residue_features, pos_CA, pos_CB, atom2residue, frames = self.geometric_processor.aggregate_atoms_to_residues(
                 InterfaceGraphData(
                     node_features=updated_x,
                     edge_index=graph_data.edge_index,
@@ -540,20 +612,25 @@ class SimplifiedGeometricGNN(nn.Module):
                     residue_features_batch = residue_features.unsqueeze(0)
                     pos_CA_batch = pos_CA.unsqueeze(0)
                     pos_CB_batch = pos_CB.unsqueeze(0)
+                    frames_batch = frames.unsqueeze(0)
                     mask = torch.ones(1, residue_features.shape[0], dtype=torch.bool, device=updated_x.device)
                     
-                    # 应用位置感知注意力
+                    # 应用基于 GearBind DDGAttention 的位置感知注意力
                     enhanced_residue = self.geometric_processor.apply_positional_attention(
-                        residue_features_batch, pos_CA_batch, pos_CB_batch, mask
+                        residue_features_batch, pos_CA_batch, pos_CB_batch, frames_batch, mask
                     )
                     
-                    # 将增强特征映射回原子级（简单版本）
+                    # 将增强特征映射回原子级（避免原地操作）
+                    enhanced_expanded = torch.zeros_like(updated_x)
                     for i, res_idx in enumerate(torch.unique(atom2residue)):
                         if res_idx < enhanced_residue.shape[1]:
                             enhanced_feat = enhanced_residue[0, i]
                             atom_mask = atom2residue == res_idx
                             if atom_mask.any():
-                                updated_x[atom_mask] = updated_x[atom_mask] + enhanced_feat * 0.1
+                                enhanced_expanded[atom_mask] = enhanced_feat * 0.1
+                    
+                    # 使用加法而不是原地操作
+                    updated_x = updated_x + enhanced_expanded
         
         # 全局池化
         if graph_data.batch.dtype != torch.int64:
