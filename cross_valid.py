@@ -13,12 +13,15 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from sklearn.model_selection import KFold
 from typing import Dict, List, Tuple, Optional, Any
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.metrics import mean_squared_error, r2_score
 from scipy.stats import pearsonr
 import argparse
 
 # 导入模型定义和数据集
-from model import CHYModelWithGeometric
+# from model import CHYModelWithGeometric
+# from model_wo_esm import CHYModelWithGeometric
+# from model_wo_foldx import CHYModelWithGeometric
+from model_wo_esm_foldx import CHYModelWithGeometric
 from dataset import create_dataloader, print_data_statistics
 
 
@@ -83,14 +86,12 @@ class Trainer:
             
             # 前向传播
             self.optimizer.zero_grad()
-            if wt_graph is not None and mt_graph is not None:
-                # 使用几何特征
-                wt_graph = wt_graph.to(self.device)
-                mt_graph = mt_graph.to(self.device)
-                ddg_pred = self.model(esm_emb, foldx_feat, wt_graph, mt_graph, attention_mask)
-            else:
-                # 不使用几何特征（向后兼容）
-                ddg_pred = self.model(esm_emb, foldx_feat, attention_mask)
+            wt_graph = wt_graph.to(self.device)
+            mt_graph = mt_graph.to(self.device)
+
+            # attention_mask is used by esm
+            # ddg_pred = self.model(esm_emb, foldx_feat, wt_graph, mt_graph, attention_mask)
+            ddg_pred = self.model(wt_graph, mt_graph)
             
             # 使用组合损失
             if self.loss_type == "mse":
@@ -189,7 +190,8 @@ class Trainer:
                     # 使用几何特征
                     wt_graph = wt_graph.to(self.device)
                     mt_graph = mt_graph.to(self.device)
-                    ddg_pred = self.model(esm_emb, foldx_feat, wt_graph, mt_graph, attention_mask)
+                    # ddg_pred = self.model(esm_emb, foldx_feat, wt_graph, mt_graph, attention_mask)
+                    ddg_pred = self.model(wt_graph, mt_graph)
                 else:
                     # 不使用几何特征（向后兼容）
                     ddg_pred = self.model(esm_emb, foldx_feat, attention_mask)
@@ -296,11 +298,11 @@ def train_fold(
         
         # 根据配置选择模型
         model = CHYModelWithGeometric(
-            esm_dim=config.get('esm_embedding_dim', 1280),
-            foldx_dim=config.get('foldx_features', 22),
+            # esm_dim=config.get('esm_embedding_dim', 1280),
+            # foldx_dim=config.get('foldx_features', 22),
             hidden_dim=config.get('hidden_dims', [512, 256, 128])[0],
-            num_heads=config.get('num_attention_heads', 8),
-            num_layers=config.get('num_attention_layers', 2)
+            # num_heads=config.get('num_attention_heads', 8),
+            # num_layers=config.get('num_attention_layers', 2)
         )
 
         trainer = Trainer(

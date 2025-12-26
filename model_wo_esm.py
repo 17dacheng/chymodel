@@ -22,39 +22,17 @@ class CHYModelWithGeometric(nn.Module):
     def __init__(self, 
                  esm_dim: int = 1280,
                  foldx_dim: int = 22,
-                 hidden_dim: int = 512,
-                 num_heads: int = 8,
-                 num_layers: int = 3):
+                 hidden_dim: int = 512):
         super(CHYModelWithGeometric, self).__init__()
         
         self.esm_dim = esm_dim
         self.foldx_dim = foldx_dim
         
-        # FoldX特征投影 - 与ESM特征保持相同维度
+        # FoldX特征投影 - 输出128维
         self.foldx_projection = nn.Sequential(
-            nn.Linear(foldx_dim, hidden_dim // 4),  # 直接输出128维，与ESM特征相同
+            nn.Linear(foldx_dim, hidden_dim // 4),  # 直接输出128维
             nn.LayerNorm(hidden_dim // 4),
             nn.ReLU()
-        )
-        
-        # ESM特征处理 - 降低维度
-        self.esm_projection = nn.Sequential(
-            nn.Linear(esm_dim, hidden_dim // 4),  # 降低到128维
-            nn.LayerNorm(hidden_dim // 4),
-            nn.ReLU()
-        )
-        
-        # Transformer编码器
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim // 4,  # 降低到128维
-            nhead=num_heads // 2,     # 减少注意力头数
-            dim_feedforward=hidden_dim // 2,
-            dropout=0,  # 不使用dropout
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers
         )
         
         # 几何特征处理 - 使用单个共享的GNN实例
@@ -65,10 +43,10 @@ class CHYModelWithGeometric(nn.Module):
             num_heads=4
         )
         
-        # 序列和FoldX特征融合MLP
-        self.seq_foldx_mlp = nn.Sequential(
+        # FoldX特征处理MLP（原来是seq_foldx_mlp，现在只处理FoldX）
+        self.foldx_mlp = nn.Sequential(
             nn.Linear(
-                hidden_dim // 4 + hidden_dim // 4,  # seq_rep + foldx_expanded = 128 + 128 = 256
+                hidden_dim // 4,  # 只处理FoldX特征 = 128维
                 hidden_dim // 2  # 中间层
             ),
             nn.LayerNorm(hidden_dim // 2),
@@ -91,10 +69,10 @@ class CHYModelWithGeometric(nn.Module):
             nn.ReLU()
         )
         
-        # 特征融合注意力权重（强调反对称特征的重要性）
+        # 特征融合注意力权重（只有FoldX和反对称几何特征两个权重）
         self.feature_fusion = nn.Sequential(
             nn.Linear(
-                hidden_dim // 4 + hidden_dim // 4,  # seq_foldx + antisymmetric = 128 + 128 = 256
+                hidden_dim // 4 + hidden_dim // 4,  # foldx + antisymmetric = 128 + 128 = 256
                 hidden_dim // 2  # 中间层维度
             ),
             nn.LayerNorm(hidden_dim // 2),
@@ -138,15 +116,15 @@ class CHYModelWithGeometric(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
         
-        # 特别初始化特征融合层的偏置，让反对称特征权重更高
+        # 特别初始化特征融合层的偏置，让FoldX特征权重稍高一些
         if hasattr(self, 'feature_fusion'):
             # feature_fusion的最后一层Linear层输出2个权重
-            # 设置偏置让第二个权重（反对称特征）初始为0.7，第一个为0.3
+            # 设置偏置让第二个权重（反对称特征）初始为0.7，第一个（FoldX）为0.3
             fusion_layers = list(self.feature_fusion.children())
             for layer in fusion_layers:
                 if isinstance(layer, nn.Linear) and layer.out_features == 2:
                     with torch.no_grad():
-                        layer.bias.data = torch.tensor([0.3, 0.7])  # [seq_weight, antisymmetric_weight]
+                        layer.bias.data = torch.tensor([0.3, 0.7])  # [foldx_weight, antisymmetric_weight]
     
     def forward(self, 
                 esm_embeddings: torch.Tensor,
@@ -158,11 +136,11 @@ class CHYModelWithGeometric(nn.Module):
         前向传播
         
         Args:
-            esm_embeddings: [batch_size, seq_len, esm_dim] ESM嵌入
+            esm_embeddings: [batch_size, seq_len, esm_dim] ESM嵌入（不使用）
             foldx_features: [batch_size, foldx_dim] FoldX能量项
             wt_graph_data: 野生型界面图数据
             mt_graph_data: 突变型界面图数据
-            attention_mask: [batch_size, seq_len] 注意力掩码
+            attention_mask: [batch_size, seq_len] 注意力掩码（不使用）
             
         Returns:
             ddg_predictions: [batch_size, 1] ΔΔG预测值
@@ -172,37 +150,17 @@ class CHYModelWithGeometric(nn.Module):
         
         # 1. 处理FoldX特征
         foldx_start = time.time()
-        foldx_proj = self.foldx_projection(foldx_features)  # [batch_size, esm_dim//2]
+        foldx_proj = self.foldx_projection(foldx_features)  # [batch_size, hidden_dim//4=128]
         foldx_time = time.time() - foldx_start
         
-        # 2. 处理ESM特征
-        esm_start = time.time()
-        esm_proj = self.esm_projection(esm_embeddings)  # [batch_size, seq_len, hidden_dim//4]
-        esm_time = time.time() - esm_start
-        
-        # 3. Transformer编码
-        if attention_mask is not None:
-            if attention_mask.dim() == 2:
-                src_key_padding_mask = (attention_mask == 0)
-            else:
-                src_key_padding_mask = (attention_mask.squeeze(1) == 0)
-        
-        transformer_output = self.transformer_encoder(
-            esm_proj,
-            src_key_padding_mask=src_key_padding_mask if attention_mask is not None else None
-        )  # [batch_size, seq_len, hidden_dim//4=128]
-        
-        # 全局平均池化
-        seq_rep = transformer_output.mean(dim=1)  # [batch_size, hidden_dim//4]
-        
-        # 4. 处理几何特征（WT和MT使用共享的GNN实例分别处理）
+        # 2. 处理几何特征（WT和MT使用共享的GNN实例分别处理）
         geom_start = time.time()
         wt_geom_rep = self.geometric_gnn(wt_graph_data)  # [2, hidden_dim//4] (WT=0, MT=1)
         mt_geom_rep = self.geometric_gnn(mt_graph_data)  # [2, hidden_dim//4] (WT=0, MT=1)
         geom_time = time.time() - geom_start
         
         # 确保所有特征都有相同的batch size
-        batch_size = seq_rep.shape[0]
+        batch_size = foldx_proj.shape[0]
         
         # 处理几何特征 - 确保batch维度匹配
         if wt_geom_rep.shape[0] >= batch_size:
@@ -218,15 +176,8 @@ class CHYModelWithGeometric(nn.Module):
         # 确保几何特征维度正确（当前已经是128维）
         # 几何特征已经通过SimplifiedGeometricGNN输出为128维
         
-        # FoldX特征现在已经是128维，直接使用
-        foldx_expanded = foldx_proj  # [batch_size, hidden_dim//4=128]
-        
-        # 1. 序列和FoldX特征单独处理
-        seq_foldx_combined = torch.cat([
-            seq_rep,  # 序列特征 [batch_size, hidden_dim//4=128]
-            foldx_expanded,  # FoldX特征 [batch_size, hidden_dim//4=128]
-        ], dim=-1)  # [batch_size, 256]
-        seq_foldx_features = self.seq_foldx_mlp(seq_foldx_combined)  # [batch_size, hidden_dim//4=128]
+        # 1. FoldX特征处理
+        foldx_features_processed = self.foldx_mlp(foldx_proj)  # [batch_size, hidden_dim//4=128]
         
         # 2. 几何特征反对称性处理
         # 创建两种组合用于反对称计算
@@ -240,20 +191,20 @@ class CHYModelWithGeometric(nn.Module):
         # 反对称性计算: geom_antisymmetric = mlp([MT, WT]) - mlp([WT, MT])
         geometric_antisymmetric = mlp_geom_mt_wt - mlp_geom_wt_mt  # [batch_size, hidden_dim//4=128]
         
-        # 3. 特征融合（强调反对称几何特征的重要性）
-        # 拼接序列/FoldX特征和反对称几何特征
+        # 3. 特征融合（FoldX特征和反对称几何特征）
+        # 拼接FoldX特征和反对称几何特征
         fusion_input = torch.cat([
-            seq_foldx_features,  # [batch_size, 128]
-            geometric_antisymmetric  # [batch_size, 128]
+            foldx_features_processed,  # [batch_size, 128] FoldX特征
+            geometric_antisymmetric  # [batch_size, 128] 几何反对称特征
         ], dim=-1)  # [batch_size, 256]
         
-        # 计算注意力权重（偏向反对称特征）
+        # 计算注意力权重
         fusion_weights = self.feature_fusion(fusion_input)  # [batch_size, 2]
         
-        # 应用权重进行加权融合，给反对称特征更高的重要性
+        # 应用权重进行加权融合
         # 现在两个特征都是128维，可以直接加权融合
         weighted_features = (
-            fusion_weights[:, 0:1] * seq_foldx_features +  # 序列/FoldX权重
+            fusion_weights[:, 0:1] * foldx_features_processed +  # FoldX特征权重
             fusion_weights[:, 1:2] * geometric_antisymmetric  # 几何反对称权重
         )  # [batch_size, 128]
         
@@ -266,6 +217,7 @@ class CHYModelWithGeometric(nn.Module):
         # 打印各部分处理时间
         total_forward_time = time.time() - forward_start_time
         # print(f"前向传播时间统计:")
+        # print(f"  - FoldX特征处理: {foldx_time:.3f}秒")
         # print(f"  - 几何特征处理: {geom_time:.3f}秒")
         # print(f"  - 总前向传播时间: {total_forward_time:.3f}秒")
         
@@ -273,7 +225,7 @@ class CHYModelWithGeometric(nn.Module):
 
 
 class DDGModelTester:
-    """集成几何特征的模型测试器 - 压缩特征维度版本"""
+    """集成几何特征的模型测试器 - 无ESM特征版本"""
     
     def __init__(self, pdb_base_path: str,
                  weights_path: str = "/home/chengwang/weights/esm2",
@@ -290,11 +242,11 @@ class DDGModelTester:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"使用设备: {self.device}")
         
-        # 初始化特征提取器
+        # 初始化特征提取器（不使用ESM）
         self.feature_extractor = RealFeatureExtractor(
             pdb_base_path=str(pdb_base_path),
             cache_dir=str(cache_dir),
-            use_esm=True,
+            use_esm=False,  # 不使用ESM
             weights_path=str(weights_path)
         )
         
@@ -317,6 +269,7 @@ class DDGModelTester:
         print(f"  - 缓存目录: {cache_dir}")
         print(f"  - 使用几何特征: {use_geometric}")
         print(f"  - 模型检查点: {model_checkpoint if model_checkpoint else '无'}")
+        print(f"  - 不使用ESM特征: True")
         print("-" * 50)
     
     def load_model_checkpoint(self, checkpoint_path: str):
@@ -636,6 +589,7 @@ class DDGModelTester:
         
         return edge_types
 
+
     def test_from_csv(self, csv_path, pdb_col="#Pdb_origin", mutation_col="Mutation(s)_cleaned", limit=None):
         """
         从CSV文件读取突变数据并进行测试
@@ -722,11 +676,11 @@ class DDGModelTester:
         with torch.no_grad():
             if self.use_geometric and wt_graph is not None and mt_graph is not None:
                 ddg_pred = self.model(
-                    esm_embeddings, 
+                    esm_embeddings,  # 虽然传入但模型内部不会使用
                     foldx_features, 
                     wt_graph, 
                     mt_graph, 
-                    attention_mask
+                    attention_mask  # 虽然传入但模型内部不会使用
                 )
             else:
                 # 如果没有几何特征或使用非几何模型，创建默认的空图数据
@@ -744,11 +698,11 @@ class DDGModelTester:
                         residue_indices=[""]  # 添加缺失的残基索引
                     )
                     ddg_pred = self.model(
-                        esm_embeddings, 
+                        esm_embeddings,  # 虽然传入但模型内部不会使用
                         foldx_features, 
                         dummy_graph_data, 
                         dummy_graph_data, 
-                        attention_mask
+                        attention_mask  # 虽然传入但模型内部不会使用
                     )
                 else:
                     ddg_pred = self.model(esm_embeddings, foldx_features, attention_mask)
@@ -764,7 +718,8 @@ class DDGModelTester:
             'energy_values': energy_feature.tolist(),
             'status': 'success',
             'use_geometric': self.use_geometric,
-            'total_time': total_time
+            'total_time': total_time,
+            'wo_esm': True
         }
         
         print(f"  预测ΔΔG: {ddg_pred.item():.3f} kcal/mol")
@@ -793,8 +748,8 @@ class DDGModelTester:
             print(f"  范围: [{np.min(predictions):.3f}, {np.max(predictions):.3f}] kcal/mol")
 
 
-def load_pretrained_geometric_model(model_path: str, device: str = 'cpu') -> Union[CHYModelWithGeometric]:
-    """加载预训练模型"""
+def load_pretrained_geometric_model_wo_esm(model_path: str, device: str = 'cpu') -> CHYModelWithGeometric:
+    """加载预训练模型（无ESM版本）"""
     model = CHYModelWithGeometric()
     checkpoint = torch.load(model_path, map_location=device)
     
@@ -805,17 +760,17 @@ def load_pretrained_geometric_model(model_path: str, device: str = 'cpu') -> Uni
     
     model.eval()
     model.to(device)
-    print(f"从 {model_path} 加载预训练模型成功")
+    print(f"从 {model_path} 加载预训练模型成功（无ESM版本）")
     return model
 
 
 # 使用示例
 if __name__ == "__main__":    
-    # 测试带几何特征的版本 - 压缩特征维度
+    # 测试无ESM特征的几何版本
     tester = DDGModelTester(
         pdb_base_path="/home/chengwang/data/SKEMPI/PDBs_fixed",
         weights_path="/home/chengwang/weights/esm2",
-        cache_dir="./dataset_cache",
+        cache_dir="./test_cache",
         model_checkpoint=None,
         use_geometric=True  # 测试几何版本
     )
@@ -831,8 +786,8 @@ if __name__ == "__main__":
         )
         
         # 保存结果
-        tester.save_results(csv_results, "test_results_s1131.csv")
-        print(f"结果已保存到: test_results_s1131.csv")
+        tester.save_results(csv_results, "test_results_s1131_wo_esm.csv")
+        print(f"结果已保存到: test_results_s1131_wo_esm.csv")
     else:
         print(f"CSV文件不存在: {csv_path}")
         print("跳过CSV测试")
