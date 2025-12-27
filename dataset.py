@@ -8,7 +8,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, Any
 # 导入模型定义和特征提取器
-from model import DDGModelTester, InterfaceGraphData
+from model_wo_esm_foldx import DDGModelTesterGeometric as DDGModelTester, InterfaceGraphData
 from feature_extractor import RealFeatureExtractor
 
 
@@ -129,8 +129,8 @@ class SKEMPIDataset(Dataset):
         if use_geometric_features:
             self.geometric_tester = DDGModelTester(
                 pdb_base_path=pdb_base_path,
-                cache_dir=self.cache_dir,
-                use_geometric=True
+                cache_dir=str(self.cache_dir),
+                model_checkpoint=None
             )
         else:
             self.geometric_tester = None
